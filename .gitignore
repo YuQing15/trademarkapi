@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+
+# Local generated DB
+/data/
+*.sqlite
+
+# Large local source datasets (do not commit)
+*.txt
+*.xlsx
+*.xml

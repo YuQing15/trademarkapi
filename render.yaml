@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: riskchecker-api
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn backend:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: https://your-site.webflow.io,https://your-domain.com
+      - key: TRADEMARK_DB_PATH
+        value: /var/data/trademarks.sqlite
+      - key: FLASK_DEBUG
+        value: "0"
+    disk:
+      name: riskchecker-data
+      mountPath: /var/data
+      sizeGB: 10

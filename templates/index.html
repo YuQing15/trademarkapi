@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Trademark Risk Checker</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <main class="wrap">
+    <header class="hero">
+      <h1>Trademark Risk Checker</h1>
+      <p>Check text marks against your datasets and get a low / medium / high risk signal.</p>
+    </header>
+
+    <section class="card">
+      <form id="check-form">
+        <div id="js-status" class="status">JS not loaded</div>
+        <label>
+          Trade Mark text
+          <input id="trademark" name="trademark" type="text" placeholder="Enter your trade mark text" required />
+        </label>
+
+        <label>
+          Country
+          <input type="text" value="United Kingdom (UK)" readonly />
+          <input id="country" name="country" type="hidden" value="United Kingdom" />
+        </label>
+
+        <label>
+          Classes (optional)
+          <select id="classes" name="classes">
+            <option value="">No class selected</option>
+            <option value="1">Class 1 - Chemicals for use in industry, science and agriculture</option>
+            <option value="2">Class 2 - Paints, varnishes, lacquers and preservatives against rust</option>
+            <option value="3">Class 3 - Cleaning, polishing, scouring and abrasive preparations</option>
+            <option value="4">Class 4 - Industrial oils, fuels, lubricants and candles</option>
+            <option value="5">Class 5 - Pharmaceuticals, medical and veterinary preparations</option>
+            <option value="6">Class 6 - Common metals and their alloys, metal building materials</option>
+            <option value="7">Class 7 - Machines, machine tools and motors (except land vehicles)</option>
+            <option value="8">Class 8 - Hand tools and implements, cutlery and side arms</option>
+            <option value="9">Class 9 - Scientific, electric, photographic and software goods</option>
+            <option value="10">Class 10 - Surgical, medical, dental and veterinary apparatus</option>
+            <option value="11">Class 11 - Lighting, heating, cooking, refrigerating and sanitary apparatus</option>
+            <option value="12">Class 12 - Vehicles and apparatus for locomotion by land, air or water</option>
+            <option value="13">Class 13 - Firearms, ammunition and explosives</option>
+            <option value="14">Class 14 - Precious metals, jewellery, watches and clocks</option>
+            <option value="15">Class 15 - Musical instruments and related accessories</option>
+            <option value="16">Class 16 - Paper goods, printed matter, stationery and office supplies</option>
+            <option value="17">Class 17 - Rubber, gutta-percha, gum, asbestos, mica and plastics</option>
+            <option value="18">Class 18 - Leather, luggage, bags, umbrellas and saddlery</option>
+            <option value="19">Class 19 - Non-metal building materials</option>
+            <option value="20">Class 20 - Furniture, mirrors and goods not of metal or plastic</option>
+            <option value="21">Class 21 - Household or kitchen utensils, containers and glassware</option>
+            <option value="22">Class 22 - Ropes, string, tents, awnings and textile fibers</option>
+            <option value="23">Class 23 - Yarns and threads for textile use</option>
+            <option value="24">Class 24 - Textiles and textile goods, bed and table covers</option>
+            <option value="25">Class 25 - Clothing, footwear and headgear</option>
+            <option value="26">Class 26 - Lace, embroidery, ribbons, buttons and artificial flowers</option>
+            <option value="27">Class 27 - Carpets, rugs, mats and floor coverings</option>
+            <option value="28">Class 28 - Games, toys and sporting articles</option>
+            <option value="29">Class 29 - Meat, fish, poultry, dairy products and preserved foods</option>
+            <option value="30">Class 30 - Coffee, tea, cocoa, sugar, bread and confectionery</option>
+            <option value="31">Class 31 - Agricultural, horticultural and forestry products</option>
+            <option value="32">Class 32 - Beers and non-alcoholic beverages</option>
+            <option value="33">Class 33 - Alcoholic beverages except beers</option>
+            <option value="34">Class 34 - Tobacco and smokers' articles</option>
+            <option value="35">Class 35 - Advertising, business management and office functions</option>
+            <option value="36">Class 36 - Insurance, financial affairs and real estate affairs</option>
+            <option value="37">Class 37 - Building construction, repair and installation services</option>
+            <option value="38">Class 38 - Telecommunications services</option>
+            <option value="39">Class 39 - Transport, packaging and storage of goods, travel arrangements</option>
+            <option value="40">Class 40 - Treatment of materials</option>
+            <option value="41">Class 41 - Education, training, entertainment and sporting activities</option>
+            <option value="42">Class 42 - Scientific and technological services, design and software services</option>
+            <option value="43">Class 43 - Services for providing food and drink, temporary accommodation</option>
+            <option value="44">Class 44 - Medical, hygienic and beauty care services</option>
+            <option value="45">Class 45 - Legal, security and personal social services</option>
+          </select>
+        </label>
+
+        <label class="checkbox">
+          <input id="include-patents" name="include_patents" type="checkbox" checked />
+          Include patent matches
+        </label>
+
+        <button type="submit" id="check-button">Check Risk</button>
+      </form>
+    </section>
+
+    <section class="card" id="result" hidden>
+      <div class="result-header">
+        <h2>Result</h2>
+        <span id="risk-badge" class="badge"></span>
+      </div>
+      <p id="summary"></p>
+      <ul id="notes"></ul>
+    </section>
+
+    <section class="card" id="matches" hidden>
+      <h2>Similar Marks</h2>
+      <div id="matches-list"></div>
+    </section>
+
+    <section class="card" id="patents" hidden>
+      <h2>Related Patents</h2>
+      <div id="patents-list"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js?v=9"></script>
+</body>
+</html>
