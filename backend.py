@@ -5,6 +5,8 @@ import math
 import os
 import re
 import sqlite3
+import threading
+import urllib.request
 from datetime import datetime, date
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,9 @@ from flask import Flask, jsonify, request, send_from_directory, render_template
 from flask_cors import CORS
 
 DB_PATH = Path(os.getenv("TRADEMARK_DB_PATH", "data/trademarks.sqlite"))
+DB_URL = os.getenv("TRADEMARK_DB_URL", "").strip()
+_download_lock = threading.Lock()
+_download_attempted = False
 
 app = Flask(__name__)
 
@@ -107,6 +112,33 @@ def open_db() -> sqlite3.Connection:
 
 def has_index() -> bool:
     return DB_PATH.exists()
+
+
+def ensure_index() -> tuple[bool, str]:
+    global _download_attempted
+
+    if has_index():
+        return True, ""
+
+    if not DB_URL:
+        return False, "Index not found and TRADEMARK_DB_URL is not set."
+
+    with _download_lock:
+        if has_index():
+            return True, ""
+        if _download_attempted and not has_index():
+            return False, "Index download already attempted and failed."
+        _download_attempted = True
+
+        try:
+            DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = DB_PATH.with_suffix(".download")
+            urllib.request.urlretrieve(DB_URL, tmp_path)
+            os.replace(tmp_path, DB_PATH)
+        except Exception as exc:
+            return False, f"Failed to download index from TRADEMARK_DB_URL: {exc}"
+
+    return (True, "") if has_index() else (False, "Index download completed but file not found.")
 
 
 def resolve_countries(country: str) -> list[str]:
@@ -289,8 +321,9 @@ def index():
 
 @app.route("/check", methods=["POST"])
 def check():
-    if not has_index():
-        return jsonify({"error": "Index not found. Run scripts/build_index.py first."}), 400
+    ok, msg = ensure_index()
+    if not ok:
+        return jsonify({"error": msg}), 400
 
     payload = request.get_json(force=True) or {}
     term = (payload.get("trademark") or "").strip()
@@ -352,7 +385,16 @@ def check():
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "index": has_index()})
+    ok, msg = ensure_index()
+    return jsonify(
+        {
+            "ok": True,
+            "index": ok,
+            "db_path": str(DB_PATH),
+            "db_url_configured": bool(DB_URL),
+            "message": msg,
+        }
+    )
 
 
 if __name__ == "__main__":

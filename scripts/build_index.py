@@ -64,9 +64,25 @@ def excel_date_to_iso(s: str) -> str:
 def discover_txt_files(root: Path) -> list[Path]:
     files = []
     for path in root.rglob("*.txt"):
-        if path.is_file():
+        if path.is_file() and is_trademark_text_file(path):
             files.append(path)
     return files
+
+
+def is_trademark_text_file(path: Path) -> bool:
+    try:
+        raw = path.read_bytes()[:4096]
+    except Exception:
+        return False
+
+    # UTF-16 LE/BE header variants and UTF-8 header variant
+    if b"T\x00r\x00a\x00d\x00e\x00 \x00M\x00a\x00r\x00k\x00" in raw:
+        return True
+    if b"\x00T\x00r\x00a\x00d\x00e\x00 \x00M\x00a\x00r\x00k" in raw:
+        return True
+    if b"Trade Mark|" in raw:
+        return True
+    return False
 
 
 def discover_xlsx_files(root: Path) -> list[Path]:
@@ -195,16 +211,28 @@ def build_class_codes(row: dict) -> str:
 
 
 def read_rows(path: Path):
-    # UK IPO export is UTF-16 with pipes
-    with path.open("r", encoding="utf-16", newline="") as f:
-        reader = csv.reader(f, delimiter="|")
-        headers = next(reader)
-        headers = [h.replace("\ufeff", "").strip() for h in headers]
-        yield headers
-        for row in reader:
-            if not row:
-                continue
-            yield row
+    # UK IPO exports are pipe-delimited and usually UTF-16.
+    # Some files are UTF-16 without BOM, so we try multiple encodings.
+    last_err = None
+    for enc in ("utf-16", "utf-16-le", "utf-16-be", "utf-8-sig"):
+        try:
+            with path.open("r", encoding=enc, newline="") as f:
+                reader = csv.reader(f, delimiter="|")
+                headers = next(reader)
+                headers = [h.replace("\ufeff", "").strip() for h in headers]
+                if "Trade Mark" not in headers or "Mark Text" not in headers:
+                    raise ValueError("missing expected trademark headers")
+                yield headers
+                for row in reader:
+                    if not row:
+                        continue
+                    yield row
+                return
+        except Exception as exc:
+            last_err = exc
+            continue
+
+    raise ValueError(f"Unsupported or invalid trademark text file: {path} ({last_err})")
 
 
 def col_to_index(col: str) -> int:
