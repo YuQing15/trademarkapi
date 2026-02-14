@@ -11,3 +11,6 @@ __pycache__/
 *.txt
 *.xlsx
 *.xml
+
+# Keep deploy config text files
+!requirements.txt
