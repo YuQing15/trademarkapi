@@ -21,6 +21,7 @@ from services.ukipo_fallback import UKIPOFallbackService
 DB_PATH = Path(os.getenv("TRADEMARK_DB_PATH", "data/trademarks.sqlite"))
 DB_URL = os.getenv("TRADEMARK_DB_URL", "").strip()
 ENABLE_UKIPO_FALLBACK = os.getenv("ENABLE_UKIPO_FALLBACK", "0") == "1"
+ENABLE_LOCAL_SIMILARITY = os.getenv("ENABLE_LOCAL_SIMILARITY", "0") == "1"
 UKIPO_FALLBACK_TIMEOUT = int(os.getenv("UKIPO_FALLBACK_TIMEOUT", "10"))
 UKIPO_FALLBACK_LIMIT = int(os.getenv("UKIPO_FALLBACK_LIMIT", "10"))
 UKIPO_FALLBACK_CACHE_DAYS = int(os.getenv("UKIPO_FALLBACK_CACHE_DAYS", "14"))
@@ -333,12 +334,11 @@ def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limi
 
     # 3) FTS-based broad search for similar marks.
     #
-    # On the small Render instance, multi-word FTS queries such as
-    # "lucky* buddhist*" can still trigger worker timeouts even after broad
-    # query tuning. Keep runtime predictable by skipping FTS entirely for
-    # multi-word searches. Exact and prefix matching above still run for every
-    # request, and single-word similarity remains available.
-    if len(tokenize(term_norm)) != 1:
+    # This is disabled in production by default because it is the source of the
+    # Render worker timeouts the user is seeing. Exact and prefix matching above
+    # remain active, and local similarity can be re-enabled later with a safer
+    # implementation.
+    if not ENABLE_LOCAL_SIMILARITY:
         return []
 
     fts_rows: list[sqlite3.Row] = []
@@ -736,6 +736,7 @@ def health():
             "db_path": str(DB_PATH),
             "db_url_configured": bool(DB_URL),
             "ukipo_fallback_enabled": ENABLE_UKIPO_FALLBACK,
+            "local_similarity_enabled": ENABLE_LOCAL_SIMILARITY,
             "message": msg,
         }
     )
