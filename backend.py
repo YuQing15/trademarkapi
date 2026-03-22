@@ -166,6 +166,18 @@ def build_broad_fts_terms(norm: str) -> list[str]:
     return unique_parts[:1]
 
 
+def allow_broad_local_similarity(term_norm: str) -> bool:
+    """Keep broad local similarity search on a short leash.
+
+    Multi-word searches and very long terms can explode the FTS candidate set on
+    the small Render instance and trigger gunicorn worker timeouts. For now we
+    only allow the broader local search for short single-token queries. Exact
+    and prefix search still run for every term.
+    """
+    tokens = tokenize(term_norm)
+    return len(tokens) == 1 and 4 <= len(tokens[0]) <= 12
+
+
 def local_similarity_score(term_norm: str, mark_norm: str) -> float:
     if not term_norm or not mark_norm:
         return 0.0
@@ -348,8 +360,9 @@ def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limi
                 fts_rows.append(row)
 
     add_fts_rows(build_fts_query(term_norm), max(limit * 3, 50))
-    for broad_term in build_broad_fts_terms(term_norm):
-        add_fts_rows(broad_term, max(limit, 15))
+    if allow_broad_local_similarity(term_norm):
+        for broad_term in build_broad_fts_terms(term_norm):
+            add_fts_rows(broad_term, max(limit, 15))
 
     if not fts_rows:
         return []
