@@ -139,19 +139,31 @@ def tokenize(norm: str) -> list[str]:
     return [t for t in norm.split() if t]
 
 
-def build_broad_fts_query(norm: str) -> str:
+def build_broad_fts_terms(norm: str) -> list[str]:
+    """Return bounded per-token prefix queries for broader local similarity search.
+
+    A single large OR FTS query can get expensive on the Render instance for
+    common terms. Per-token queries keep the search predictable and easier to
+    cap.
+    """
     tokens = tokenize(norm)
     if not tokens:
-        return ""
+        return []
+
     parts: list[str] = []
-    for token in tokens:
+    for token in sorted(tokens, key=len, reverse=True):
         if len(token) >= 5:
             parts.append(f"{token[:5]}*")
-        elif len(token) >= 3:
+        elif len(token) >= 4:
             parts.append(f"{token}*")
-    if not parts:
-        return ""
-    return " OR ".join(parts)
+
+    seen: set[str] = set()
+    unique_parts: list[str] = []
+    for part in parts:
+        if part not in seen:
+            seen.add(part)
+            unique_parts.append(part)
+    return unique_parts[:3]
 
 
 def local_similarity_score(term_norm: str, mark_norm: str) -> float:
@@ -336,7 +348,8 @@ def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limi
                 fts_rows.append(row)
 
     add_fts_rows(build_fts_query(term_norm), max(limit * 3, 50))
-    add_fts_rows(build_broad_fts_query(term_norm), max(limit * 8, 120))
+    for broad_term in build_broad_fts_terms(term_norm):
+        add_fts_rows(broad_term, max(limit * 2, 30))
 
     if not fts_rows:
         return []
