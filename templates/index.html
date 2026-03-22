@@ -9,8 +9,8 @@
 <body>
   <main class="wrap">
     <header class="hero">
-      <h1>Trademark Risk Checker</h1>
-      <p>Check text marks against your datasets and get a low / medium / high risk signal.</p>
+      <h1>SCREEN UK RISKS</h1>
+      <p>UK-only trademark check. Results will only show UK trade marks.</p>
     </header>
 
     <section class="card">
@@ -79,13 +79,15 @@
           </select>
         </label>
 
-        <label class="checkbox">
-          <input id="include-patents" name="include_patents" type="checkbox" checked />
-          Include patent matches
-        </label>
-
         <button type="submit" id="check-button">Check Risk</button>
       </form>
+    </section>
+
+    <section class="card" id="warning-box" hidden>
+      <p id="warning-text" class="warning-text"></p>
+      <p id="manual-search-wrap" class="manual-search-wrap" hidden>
+        <a id="manual-search-link" target="_blank" rel="noopener noreferrer">Search on UKIPO</a>
+      </p>
     </section>
 
     <section class="card" id="result" hidden>
@@ -93,6 +95,7 @@
         <h2>Result</h2>
         <span id="risk-badge" class="badge"></span>
       </div>
+      <p id="source-label" class="source-label"></p>
       <p id="summary"></p>
       <ul id="notes"></ul>
     </section>
@@ -101,13 +104,8 @@
       <h2>Similar Marks</h2>
       <div id="matches-list"></div>
     </section>
-
-    <section class="card" id="patents" hidden>
-      <h2>Related Patents</h2>
-      <div id="patents-list"></div>
-    </section>
   </main>
 
-  <script src="/static/app.js?v=9"></script>
+  <script src="/static/app.js?v=10"></script>
 </body>
 </html>

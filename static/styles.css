@@ -55,6 +55,25 @@ form {
   color: var(--muted);
 }
 
+.warning-text {
+  margin: 0;
+  color: var(--warn);
+}
+
+.manual-search-wrap {
+  margin: 10px 0 0;
+}
+
+.manual-search-wrap a,
+.source-label {
+  color: var(--muted);
+}
+
+.source-label {
+  margin: 8px 0 0;
+  font-size: 14px;
+}
+
 label {
   display: grid;
   gap: 6px;
@@ -134,13 +153,21 @@ button:hover {
 .match .meta {
   color: var(--muted);
   font-size: 13px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.match .meta a {
+  color: var(--accent);
+  text-decoration: underline;
 }
 
 .match .title-row {
   display: flex;
   gap: 8px;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
+  flex-wrap: wrap;
 }
 
 .pill {
@@ -183,6 +210,20 @@ details summary {
   cursor: pointer;
   color: var(--muted);
   font-size: 13px;
+}
+
+.goods-box {
+  margin-top: 8px;
+  background: #fbf8f2;
+  border: 1px solid #eee6d9;
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.goods-title {
+  font-size: 13px;
+  font-weight: 700;
+  margin-bottom: 6px;
 }
 
 .class-guide {

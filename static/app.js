@@ -60,23 +60,48 @@ function init() {
 
   const result = document.getElementById('result');
   const matches = document.getElementById('matches');
-  const patents = document.getElementById('patents');
   const riskBadge = document.getElementById('risk-badge');
   const summary = document.getElementById('summary');
   const notes = document.getElementById('notes');
   const matchesList = document.getElementById('matches-list');
-  const patentsList = document.getElementById('patents-list');
+  const warningBox = document.getElementById('warning-box');
+  const warningText = document.getElementById('warning-text');
+  const manualSearchWrap = document.getElementById('manual-search-wrap');
+  const manualSearchLink = document.getElementById('manual-search-link');
+  const sourceLabel = document.getElementById('source-label');
 
   function setBadge(level) {
     riskBadge.textContent = level.toUpperCase();
     riskBadge.className = `badge ${level}`;
   }
 
+  function regUrl(regNo) {
+    if (!regNo) return '';
+    const cleaned = String(regNo).trim();
+    return `https://trademarks.ipo.gov.uk/ipo-tmcase/page/Results/1/${encodeURIComponent(cleaned)}`;
+  }
+
+  function titleCaseWord(s) {
+    if (!s) return '';
+    return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+  }
+
+  function prettySource(source) {
+    const map = {
+      local_database: 'Source: local database',
+      ukipo_fallback: 'Source: UKIPO fallback',
+      ukipo_fallback_cache: 'Source: UKIPO fallback cache',
+      no_match: 'Source: no local match found'
+    };
+    return map[source] || `Source: ${source || 'unknown'}`;
+  }
+
   function renderMatch(m) {
     const el = document.createElement('div');
     el.className = 'match';
     const classes = (m.class_codes || []).join(', ') || '—';
-    const active = m.active ? 'Active' : 'Inactive';
+    const statusText = m.status_display || m.status || '—';
+    const active = m.active ? 'Active' : (statusText === 'Closed' ? 'Closed' : 'Inactive');
     const age = m.age_years !== null ? `${m.age_years}y` : '—';
     const goods = m.goods_services || '—';
     const classCards = (m.class_codes || [])
@@ -95,51 +120,22 @@ function init() {
     const classGuide = classCards
       ? `<div class="class-guide">${classCards}</div>`
       : `<div class="class-guide-empty">No class details available for this mark.</div>`;
+    const reg = m.reg_no || '—';
+    const regLink = reg !== '—'
+      ? `<a href="${regUrl(reg)}" target="_blank" rel="noopener noreferrer">${reg}</a>`
+      : '—';
     el.innerHTML = `
       <div class="title-row">
         <h3>${m.mark_text}</h3>
         <span class="${m.active ? 'pill active' : 'pill inactive'}">${active}</span>
       </div>
-      <div class="meta">Reg: ${m.reg_no || '—'} | Owner: ${m.owner_name || '—'} | Status: ${m.status || '—'}</div>
+      <div class="meta">Trade Mark No: ${regLink} | Owner: ${m.owner_name || '—'} | Status: ${statusText}</div>
       <div class="meta">Type: ${m.mark_type || '—'} | Classes: ${classes} | Filed age: ${age} | Similarity: ${m.similarity}</div>
-      <details>
-        <summary>Goods & services</summary>
+      <div class="goods-box">
+        <div class="goods-title">Goods & Services</div>
         ${classGuide}
         <div class="meta">${goods}</div>
-      </details>
-    `;
-    return el;
-  }
-
-  function renderPatent(p) {
-    const el = document.createElement('div');
-    el.className = 'match';
-    const ipc = [p.ipc7, p.ipc8].filter(Boolean).join(' / ') || '—';
-    const age = p.age_years !== null ? `${p.age_years}y` : '—';
-    const pubDates = [p.publication_a_date, p.publication_b_date].filter(Boolean).join(' / ') || '—';
-    const notInForce = p.date_not_in_force || '—';
-    const reason = p.reason_not_in_force || '—';
-    const statusPill = p.active ? 'pill active' : 'pill inactive';
-    const statusText = p.active ? 'Active' : 'Inactive';
-    el.innerHTML = `
-      <div class="title-row">
-        <h3>${p.application_number || '—'} ${p.publication_number ? `(${p.publication_number})` : ''}</h3>
-        <span class="${statusPill}">${statusText}</span>
       </div>
-      <div class="meta">Applicant: ${p.applicant_name || '—'} | Status: ${p.status || '—'} | Similarity: ${p.similarity}</div>
-      <div class="patent-grid">
-        <div><span>IPC</span>${ipc}</div>
-        <div><span>Country</span>${p.applicant_country || '—'}</div>
-        <div><span>Filed Age</span>${age}</div>
-      </div>
-      <details>
-        <summary>More patent details</summary>
-        <div class="patent-grid" style="margin-top:8px;">
-          <div><span>Publications</span>${pubDates}</div>
-          <div><span>Not In Force</span>${notInForce}</div>
-          <div><span>Reason</span>${reason}</div>
-        </div>
-      </details>
     `;
     return el;
   }
@@ -155,12 +151,11 @@ function init() {
     const trademarkEl = document.getElementById('trademark');
     const countryEl = document.getElementById('country');
     const classesEl = document.getElementById('classes');
-    const includeEl = document.getElementById('include-patents');
 
     const trademark = trademarkEl ? trademarkEl.value.trim() : '';
     const country = countryEl ? countryEl.value : '';
     const classes = classesEl ? classesEl.value.trim() : '';
-    const include_patents = includeEl ? includeEl.checked : false;
+    const include_patents = false;
 
     if (!trademark) {
       alert('Please enter a trademark');
@@ -215,8 +210,33 @@ function init() {
     }
 
     setBadge(data.risk_level);
-    const patentText = data.patent_count ? ` and ${data.patent_count} related patents` : '';
-    summary.textContent = `Found ${data.match_count} similar marks${patentText} for "${data.trademark}" in ${data.country}.`;
+    summary.textContent = `${data.match_count} similar marks found for "${titleCaseWord(data.trademark)}" in the UK`;
+    if (sourceLabel) {
+      sourceLabel.textContent = prettySource(data.result_source);
+    }
+
+    const warnings = data.warnings || [];
+    if (warningBox && warningText) {
+      if (warnings.length) {
+        warningText.textContent = warnings[0];
+        warningBox.hidden = false;
+      } else {
+        warningText.textContent = '';
+        warningBox.hidden = true;
+      }
+    }
+
+    if (manualSearchWrap && manualSearchLink) {
+      if (data.ukipo_manual_search_url && warnings.length) {
+        manualSearchLink.href = data.ukipo_manual_search_url;
+        manualSearchLink.textContent = `Search "${data.ukipo_manual_search_term || data.trademark}" on UKIPO`;
+        manualSearchWrap.hidden = false;
+      } else {
+        manualSearchLink.removeAttribute('href');
+        manualSearchWrap.hidden = true;
+      }
+    }
+
     notes.innerHTML = '';
     (data.notes || []).forEach(n => {
       const li = document.createElement('li');
@@ -229,14 +249,8 @@ function init() {
       matchesList.appendChild(renderMatch(m));
     });
 
-    patentsList.innerHTML = '';
-    (data.patents || []).forEach(p => {
-      patentsList.appendChild(renderPatent(p));
-    });
-
     result.hidden = false;
     matches.hidden = false;
-    patents.hidden = !(data.patents && data.patents.length);
 
     if (checkBtn) {
       checkBtn.disabled = false;

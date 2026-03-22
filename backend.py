@@ -106,6 +106,20 @@ def is_active(status: str, expired: str) -> bool:
     return True
 
 
+def status_display(status: str, expired: str) -> str:
+    status_norm = (status or "").strip().lower()
+    if status_norm in {"dead", "expired", "withdrawn", "revoked", "cancelled", "removed"}:
+        return "Closed"
+    if expired:
+        try:
+            exp = datetime.strptime(expired, "%Y-%m-%d").date()
+            if exp < now_date():
+                return "Closed"
+        except ValueError:
+            pass
+    return status or "—"
+
+
 def similarity(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
@@ -119,6 +133,46 @@ def build_fts_query(norm: str) -> str:
         return ""
     tokens = norm.split()
     return " ".join([f"{t}*" for t in tokens])
+
+
+def tokenize(norm: str) -> list[str]:
+    return [t for t in norm.split() if t]
+
+
+def build_broad_fts_query(norm: str) -> str:
+    tokens = tokenize(norm)
+    if not tokens:
+        return ""
+    parts: list[str] = []
+    for token in tokens:
+        if len(token) >= 5:
+            parts.append(f"{token[:5]}*")
+        elif len(token) >= 3:
+            parts.append(f"{token}*")
+    if not parts:
+        return ""
+    return " OR ".join(parts)
+
+
+def local_similarity_score(term_norm: str, mark_norm: str) -> float:
+    if not term_norm or not mark_norm:
+        return 0.0
+    if term_norm == mark_norm:
+        return 1.0
+
+    seq = similarity(term_norm, mark_norm)
+    term_tokens = set(tokenize(term_norm))
+    mark_tokens = set(tokenize(mark_norm))
+    overlap = len(term_tokens & mark_tokens) / max(len(term_tokens), 1)
+
+    prefix_bonus = 0.0
+    if mark_norm.startswith(term_norm) or term_norm.startswith(mark_norm):
+        prefix_bonus = 0.18
+    elif any(mt.startswith(tt[:4]) for tt in term_tokens for mt in mark_tokens if len(tt) >= 4):
+        prefix_bonus = 0.12
+
+    contains_bonus = 0.08 if term_norm in mark_norm or mark_norm in term_norm else 0.0
+    return min(1.0, seq * 0.62 + overlap * 0.22 + prefix_bonus + contains_bonus)
 
 
 def open_db() -> sqlite3.Connection:
@@ -253,8 +307,46 @@ def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limi
     if rows:
         return rows
 
-    # No FTS fallback here to avoid long-running scans on large datasets.
-    return []
+    # 3) FTS-based broad search for similar marks.
+    fts_rows: list[sqlite3.Row] = []
+    candidate_ids: set[int] = set()
+
+    def add_fts_rows(match_query: str, row_limit: int) -> None:
+        if not match_query:
+            return
+        try:
+            rows_local = con.execute(
+                """
+                SELECT m.*
+                FROM marks_fts f
+                JOIN marks m ON m.id = f.rowid
+                WHERE m.country IN (""" + placeholders + """)
+                  AND f.mark_text MATCH ?
+                LIMIT ?
+                """,
+                (*countries, match_query, row_limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return
+
+        for row in rows_local:
+            row_id = row["id"]
+            if row_id not in candidate_ids:
+                candidate_ids.add(row_id)
+                fts_rows.append(row)
+
+    add_fts_rows(build_fts_query(term_norm), max(limit * 3, 50))
+    add_fts_rows(build_broad_fts_query(term_norm), max(limit * 8, 120))
+
+    if not fts_rows:
+        return []
+
+    ranked = sorted(
+        fts_rows,
+        key=lambda row: local_similarity_score(term_norm, row["mark_text_norm"] or ""),
+        reverse=True,
+    )
+    return ranked[:limit]
 
 
 def _cache_is_fresh(fetched_at: str) -> bool:
@@ -366,6 +458,20 @@ def query_patents(con: sqlite3.Connection, term_norm: str, limit: int = 25) -> l
     return rows
 
 
+def dedupe_mark_rows(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+    seen: set[str] = set()
+    unique: list[sqlite3.Row] = []
+    for row in rows:
+        key = (row["reg_no"] or "").strip()
+        if not key:
+            key = f"row:{row['id']}"
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(row)
+    return unique
+
+
 def score_risk(matches: list[dict[str, Any]], class_filter: list[str]) -> str:
     active_strong = 0
     active_medium = 0
@@ -398,7 +504,7 @@ def country_available(con: sqlite3.Connection, country: str) -> bool:
 def summarize_mark(row: sqlite3.Row, term_norm: str) -> dict[str, Any]:
     mark_text = row["mark_text"] or ""
     mark_norm = norm_text(mark_text)
-    sim = similarity(term_norm, mark_norm)
+    sim = local_similarity_score(term_norm, mark_norm)
 
     filed = row["filed"] or ""
     registered = row["registered"] or ""
@@ -411,6 +517,7 @@ def summarize_mark(row: sqlite3.Row, term_norm: str) -> dict[str, Any]:
         "owner_type": row["owner_type"] if "owner_type" in row.keys() else infer_owner_type(row["owner_name"] or ""),
         "country": row["country"],
         "status": row["status"],
+        "status_display": status_display(row["status"], expired),
         "category": row["category"] if "category" in row.keys() else "",
         "mark_type": row["mark_type"] if "mark_type" in row.keys() else "",
         "filed": filed,
@@ -527,6 +634,7 @@ def check():
     patent_rows = query_patents(con, term_norm) if include_patents else []
     con.close()
 
+    rows = dedupe_mark_rows(rows)
     matches = [summarize_mark(r, term_norm) for r in rows]
     for match in matches:
         match["data_source"] = result_source if result_source != "local_database" else "local_database"
@@ -541,7 +649,10 @@ def check():
     patents.sort(key=lambda p: (p["active"], p["similarity"]), reverse=True)
     patents = patents[:50]
 
+    ukipo_manual_search_url = "https://trademarks.ipo.gov.uk/ipo-tmtext?reset"
+
     if not matches:
+        result_source = "no_match"
         if fallback_allowed(country) and fallback_error:
             warnings.append(
                 "No local match was found, and the live UKIPO fallback is temporarily unavailable. "
@@ -566,6 +677,8 @@ def check():
             "fallback_used": fallback_used,
             "fallback_error": fallback_error,
             "warnings": warnings,
+            "ukipo_manual_search_url": ukipo_manual_search_url,
+            "ukipo_manual_search_term": term,
             "match_count": len(matches),
             "patent_count": len(patents),
             "notes": [
