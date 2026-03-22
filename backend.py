@@ -163,7 +163,7 @@ def build_broad_fts_terms(norm: str) -> list[str]:
         if part not in seen:
             seen.add(part)
             unique_parts.append(part)
-    return unique_parts[:3]
+    return unique_parts[:1]
 
 
 def local_similarity_score(term_norm: str, mark_norm: str) -> float:
@@ -349,7 +349,7 @@ def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limi
 
     add_fts_rows(build_fts_query(term_norm), max(limit * 3, 50))
     for broad_term in build_broad_fts_terms(term_norm):
-        add_fts_rows(broad_term, max(limit * 2, 30))
+        add_fts_rows(broad_term, max(limit, 15))
 
     if not fts_rows:
         return []
