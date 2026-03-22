@@ -332,6 +332,15 @@ def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limi
         return rows
 
     # 3) FTS-based broad search for similar marks.
+    #
+    # On the small Render instance, multi-word FTS queries such as
+    # "lucky* buddhist*" can still trigger worker timeouts even after broad
+    # query tuning. Keep runtime predictable by skipping FTS entirely for
+    # multi-word searches. Exact and prefix matching above still run for every
+    # request, and single-word similarity remains available.
+    if len(tokenize(term_norm)) != 1:
+        return []
+
     fts_rows: list[sqlite3.Row] = []
     candidate_ids: set[int] = set()
 
