@@ -21,7 +21,7 @@ from services.ukipo_fallback import UKIPOFallbackService
 DB_PATH = Path(os.getenv("TRADEMARK_DB_PATH", "data/trademarks.sqlite"))
 DB_URL = os.getenv("TRADEMARK_DB_URL", "").strip()
 ENABLE_UKIPO_FALLBACK = os.getenv("ENABLE_UKIPO_FALLBACK", "0") == "1"
-ENABLE_LOCAL_SIMILARITY = os.getenv("ENABLE_LOCAL_SIMILARITY", "0") == "1"
+ENABLE_LOCAL_SIMILARITY = os.getenv("ENABLE_LOCAL_SIMILARITY", "1") == "1"
 UKIPO_FALLBACK_TIMEOUT = int(os.getenv("UKIPO_FALLBACK_TIMEOUT", "10"))
 UKIPO_FALLBACK_LIMIT = int(os.getenv("UKIPO_FALLBACK_LIMIT", "10"))
 UKIPO_FALLBACK_CACHE_DAYS = int(os.getenv("UKIPO_FALLBACK_CACHE_DAYS", "14"))
@@ -138,6 +138,47 @@ def build_fts_query(norm: str) -> str:
 
 def tokenize(norm: str) -> list[str]:
     return [t for t in norm.split() if t]
+
+
+COMMON_SEARCH_TOKENS = {
+    "and",
+    "for",
+    "the",
+    "with",
+    "from",
+    "your",
+    "their",
+    "this",
+    "that",
+    "into",
+    "over",
+    "under",
+    "good",
+    "best",
+    "plus",
+    "care",
+    "group",
+    "world",
+    "global",
+    "service",
+    "services",
+    "company",
+    "limited",
+}
+
+
+def significant_tokens(norm: str) -> list[str]:
+    tokens = []
+    for token in tokenize(norm):
+        if token in COMMON_SEARCH_TOKENS:
+            continue
+        if token not in tokens:
+            tokens.append(token)
+
+    preferred = [t for t in tokens if len(t) >= 5]
+    if not preferred:
+        preferred = [t for t in tokens if len(t) >= 4]
+    return sorted(preferred, key=len, reverse=True)[:2]
 
 
 def build_broad_fts_terms(norm: str) -> list[str]:
@@ -300,6 +341,16 @@ def resolve_countries(country: str) -> list[str]:
 def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limit: int = 25) -> list[sqlite3.Row]:
     countries = resolve_countries(country)
     placeholders = ",".join(["?"] * len(countries))
+    candidates: list[sqlite3.Row] = []
+    seen_ids: set[int] = set()
+
+    def add_rows(rows: list[sqlite3.Row]) -> None:
+        for row in rows:
+            row_id = row["id"]
+            if row_id in seen_ids:
+                continue
+            seen_ids.add(row_id)
+            candidates.append(row)
 
     # 1) Exact match (fast)
     rows = con.execute(
@@ -312,73 +363,55 @@ def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limi
         """,
         (*countries, term_norm, limit),
     ).fetchall()
-    if rows:
-        return rows
+    add_rows(rows)
 
     # 2) Prefix match only (fast, index-friendly)
-    if len(term_norm) < 4:
-        return []
-    like = f"{term_norm}%"
-    rows = con.execute(
-        """
-        SELECT m.*
-        FROM marks m
-        WHERE m.country IN (""" + placeholders + """)
-          AND m.mark_text_norm LIKE ?
-        LIMIT ?
-        """,
-        (*countries, like, limit),
-    ).fetchall()
-    if rows:
-        return rows
+    if len(term_norm) >= 4:
+        like = f"{term_norm}%"
+        rows = con.execute(
+            """
+            SELECT m.*
+            FROM marks m
+            WHERE m.country IN (""" + placeholders + """)
+              AND m.mark_text_norm LIKE ?
+            LIMIT ?
+            """,
+            (*countries, like, limit),
+        ).fetchall()
+        add_rows(rows)
 
-    # 3) FTS-based broad search for similar marks.
+    # 3) Bounded token-prefix FTS search.
     #
-    # This is disabled in production by default because it is the source of the
-    # Render worker timeouts the user is seeing. Exact and prefix matching above
-    # remain active, and local similarity can be re-enabled later with a safer
-    # implementation.
-    if not ENABLE_LOCAL_SIMILARITY:
-        return []
+    # This stays cheap on Render by querying at most two significant tokens,
+    # each with its own LIMIT. We avoid the broad multi-token OR queries that
+    # previously caused worker timeouts.
+    if ENABLE_LOCAL_SIMILARITY:
+        for token in significant_tokens(term_norm):
+            try:
+                rows = con.execute(
+                    """
+                    SELECT m.*
+                    FROM marks_fts f
+                    JOIN marks m ON m.id = f.rowid
+                    WHERE m.country IN (""" + placeholders + """)
+                      AND f.mark_text MATCH ?
+                    LIMIT ?
+                    """,
+                    (*countries, f"{token}*", max(limit, 20)),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+            add_rows(rows)
 
-    fts_rows: list[sqlite3.Row] = []
-    candidate_ids: set[int] = set()
-
-    def add_fts_rows(match_query: str, row_limit: int) -> None:
-        if not match_query:
-            return
-        try:
-            rows_local = con.execute(
-                """
-                SELECT m.*
-                FROM marks_fts f
-                JOIN marks m ON m.id = f.rowid
-                WHERE m.country IN (""" + placeholders + """)
-                  AND f.mark_text MATCH ?
-                LIMIT ?
-                """,
-                (*countries, match_query, row_limit),
-            ).fetchall()
-        except sqlite3.OperationalError:
-            return
-
-        for row in rows_local:
-            row_id = row["id"]
-            if row_id not in candidate_ids:
-                candidate_ids.add(row_id)
-                fts_rows.append(row)
-
-    add_fts_rows(build_fts_query(term_norm), max(limit * 3, 50))
-    if allow_broad_local_similarity(term_norm):
-        for broad_term in build_broad_fts_terms(term_norm):
-            add_fts_rows(broad_term, max(limit, 15))
-
-    if not fts_rows:
+    if not candidates:
         return []
 
     ranked = sorted(
-        fts_rows,
-        key=lambda row: local_similarity_score(term_norm, row["mark_text_norm"] or ""),
+        candidates,
+        key=lambda row: (
+            is_active(row["status"], row["expired"]),
+            local_similarity_score(term_norm, row["mark_text_norm"] or ""),
+        ),
         reverse=True,
     )
     return ranked[:limit]
@@ -569,6 +602,26 @@ def summarize_mark(row: sqlite3.Row, term_norm: str) -> dict[str, Any]:
     }
 
 
+def split_mark_groups(matches: list[dict[str, Any]], class_filter: list[str]) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]:
+    reference_classes = list(class_filter)
+    if not reference_classes:
+        exact = next((m for m in matches if m.get("similarity", 0.0) >= 0.999), None)
+        if exact:
+            reference_classes = list(exact.get("class_codes", []) or [])
+
+    chosen_class_matches: list[dict[str, Any]] = []
+    cross_class_matches: list[dict[str, Any]] = []
+
+    for match in matches:
+        match_classes = set(match.get("class_codes", []))
+        if reference_classes and match_classes & set(reference_classes):
+            chosen_class_matches.append(match)
+        else:
+            cross_class_matches.append(match)
+
+    return reference_classes, chosen_class_matches, cross_class_matches
+
+
 def patent_active(status: str, date_not_in_force: str) -> bool:
     s = (status or "").strip().lower()
     if date_not_in_force:
@@ -677,8 +730,10 @@ def check():
 
     # Keep top 50
     matches = matches[:50]
+    reference_classes, chosen_class_matches, cross_class_matches = split_mark_groups(matches, class_filter)
+    matches = chosen_class_matches + cross_class_matches
 
-    risk = score_risk(matches, class_filter)
+    risk = score_risk(matches, reference_classes)
 
     patents = [summarize_patent(r, term_norm) for r in patent_rows]
     patents.sort(key=lambda p: (p["active"], p["similarity"]), reverse=True)
@@ -714,6 +769,7 @@ def check():
             "warnings": warnings,
             "ukipo_manual_search_url": ukipo_manual_search_url,
             "ukipo_manual_search_term": term,
+            "reference_classes": reference_classes,
             "match_count": len(matches),
             "patent_count": len(patents),
             "notes": [
@@ -721,6 +777,8 @@ def check():
                 "Owner business type is not provided by the dataset; owner_type is inferred from the owner name.",
             ],
             "similar_marks": matches,
+            "chosen_class_matches": chosen_class_matches,
+            "cross_class_matches": cross_class_matches,
             "patents": patents,
         }
     )
