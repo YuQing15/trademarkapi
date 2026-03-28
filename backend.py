@@ -241,6 +241,25 @@ def local_similarity_score(term_norm: str, mark_norm: str) -> float:
     return min(1.0, seq * 0.62 + overlap * 0.22 + prefix_bonus + contains_bonus)
 
 
+def token_overlap_ratio(term_norm: str, mark_norm: str) -> float:
+    term_tokens = set(tokenize(term_norm))
+    mark_tokens = set(tokenize(mark_norm))
+    if not term_tokens:
+        return 0.0
+    return len(term_tokens & mark_tokens) / len(term_tokens)
+
+
+def is_close_phrase_match(term_norm: str, mark_norm: str, sim: float) -> bool:
+    if not term_norm or not mark_norm or term_norm == mark_norm:
+        return False
+    overlap = token_overlap_ratio(term_norm, mark_norm)
+    if term_norm.startswith(mark_norm) or mark_norm.startswith(term_norm):
+        return True
+    if term_norm in mark_norm or mark_norm in term_norm:
+        return True
+    return sim >= 0.86 and overlap >= 0.5
+
+
 def open_db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH, timeout=5.0)
     con.row_factory = sqlite3.Row
@@ -602,24 +621,48 @@ def summarize_mark(row: sqlite3.Row, term_norm: str) -> dict[str, Any]:
     }
 
 
-def split_mark_groups(matches: list[dict[str, Any]], class_filter: list[str]) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]:
+def determine_reference_classes(matches: list[dict[str, Any]], class_filter: list[str], term_norm: str) -> list[str]:
     reference_classes = list(class_filter)
-    if not reference_classes:
-        exact = next((m for m in matches if m.get("similarity", 0.0) >= 0.999), None)
-        if exact:
-            reference_classes = list(exact.get("class_codes", []) or [])
+    if reference_classes:
+        return reference_classes
+
+    exact = next((m for m in matches if norm_text(m.get("mark_text", "")) == term_norm), None)
+    if exact:
+        return list(exact.get("class_codes", []) or [])
+    return []
+
+
+def rank_mark(match: dict[str, Any], term_norm: str, reference_classes: list[str]) -> tuple:
+    mark_norm = norm_text(match.get("mark_text", ""))
+    sim = float(match.get("similarity", 0.0))
+    exact = mark_norm == term_norm
+    close_phrase = is_close_phrase_match(term_norm, mark_norm, sim)
+    same_class = bool(reference_classes and (set(match.get("class_codes", [])) & set(reference_classes)))
+    overlap = token_overlap_ratio(term_norm, mark_norm)
+    return (
+        1 if exact else 0,
+        1 if close_phrase else 0,
+        1 if same_class else 0,
+        1 if match.get("active") else 0,
+        sim,
+        overlap,
+    )
+
+
+def split_mark_groups(matches: list[dict[str, Any]], reference_classes: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    ref_set = set(reference_classes)
 
     chosen_class_matches: list[dict[str, Any]] = []
     cross_class_matches: list[dict[str, Any]] = []
 
     for match in matches:
         match_classes = set(match.get("class_codes", []))
-        if reference_classes and match_classes & set(reference_classes):
+        if ref_set and match_classes & ref_set:
             chosen_class_matches.append(match)
         else:
             cross_class_matches.append(match)
 
-    return reference_classes, chosen_class_matches, cross_class_matches
+    return chosen_class_matches, cross_class_matches
 
 
 def patent_active(status: str, date_not_in_force: str) -> bool:
@@ -726,11 +769,13 @@ def check():
     matches = [summarize_mark(r, term_norm) for r in rows]
     for match in matches:
         match["data_source"] = result_source if result_source != "local_database" else "local_database"
-    matches.sort(key=lambda m: (m["active"], m["similarity"]), reverse=True)
+
+    reference_classes = determine_reference_classes(matches, class_filter, term_norm)
+    matches.sort(key=lambda m: rank_mark(m, term_norm, reference_classes), reverse=True)
 
     # Keep top 50
     matches = matches[:50]
-    reference_classes, chosen_class_matches, cross_class_matches = split_mark_groups(matches, class_filter)
+    chosen_class_matches, cross_class_matches = split_mark_groups(matches, reference_classes)
     matches = chosen_class_matches + cross_class_matches
 
     risk = score_risk(matches, reference_classes)
