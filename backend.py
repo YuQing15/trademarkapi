@@ -559,23 +559,85 @@ def dedupe_mark_rows(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
     return unique
 
 
-def score_risk(matches: list[dict[str, Any]], class_filter: list[str]) -> str:
-    active_strong = 0
-    active_medium = 0
-    for m in matches:
-        if class_filter:
-            if not set(class_filter) & set(m.get("class_codes", [])):
-                continue
-        if m["active"] and m["similarity"] >= 0.92:
-            active_strong += 1
-        elif m["active"] and m["similarity"] >= 0.85:
-            active_medium += 1
+def score_match_conflict(match: dict[str, Any], term_norm: str, reference_classes: list[str]) -> float:
+    mark_norm = norm_text(match.get("mark_text", ""))
+    sim = float(match.get("similarity", 0.0))
+    exact = mark_norm == term_norm
+    close_phrase = is_close_phrase_match(term_norm, mark_norm, sim)
+    same_class = bool(reference_classes and (set(match.get("class_codes", [])) & set(reference_classes)))
+    active = bool(match.get("active"))
 
-    if active_strong > 0:
-        return "high"
-    if active_medium > 0:
-        return "medium"
-    return "low"
+    score = 0.0
+    if exact:
+        score += 7.0
+    elif sim >= 0.96:
+        score += 5.5
+    elif close_phrase:
+        score += 4.0
+    elif sim >= 0.88:
+        score += 2.5
+    elif sim >= 0.8:
+        score += 1.2
+
+    if same_class:
+        score += 3.0
+    elif reference_classes:
+        score += 0.8
+
+    if active:
+        score += 2.5
+    else:
+        score += 0.4
+
+    overlap = token_overlap_ratio(term_norm, mark_norm)
+    score += overlap * 1.5
+    return score
+
+
+def score_risk(matches: list[dict[str, Any]], reference_classes: list[str], term_norm: str) -> tuple[str, str]:
+    if not matches:
+        return "low", "Only weak or inactive matches found"
+
+    scored: list[tuple[float, dict[str, Any], bool, bool]] = []
+    active_same_class_strong = 0
+    active_cross_class_strong = 0
+    moderate_matches = 0
+
+    for match in matches[:10]:
+        mark_norm = norm_text(match.get("mark_text", ""))
+        sim = float(match.get("similarity", 0.0))
+        exact = mark_norm == term_norm
+        same_class = bool(reference_classes and (set(match.get("class_codes", [])) & set(reference_classes)))
+        active = bool(match.get("active"))
+        score = score_match_conflict(match, term_norm, reference_classes)
+        scored.append((score, match, exact, same_class))
+
+        if active and same_class and (exact or sim >= 0.94):
+            active_same_class_strong += 1
+        elif active and sim >= 0.9:
+            active_cross_class_strong += 1
+        elif score >= 4.5:
+            moderate_matches += 1
+
+    top_score, top_match, top_exact, top_same_class = max(scored, key=lambda item: item[0])
+    total_score = sum(score for score, _, _, _ in scored)
+    top_active = bool(top_match.get("active"))
+
+    if top_exact and top_same_class and top_active:
+        return "high", "Identical active mark found in the same class"
+    if active_same_class_strong > 0:
+        return "high", "Very similar active mark found in the same class"
+    if active_same_class_strong + moderate_matches >= 2 and total_score >= 14:
+        return "high", "Multiple similar active marks found"
+
+    if active_cross_class_strong > 0 and total_score >= 8:
+        return "medium", "Active similar marks found in other classes"
+    if moderate_matches >= 2 or total_score >= 9:
+        return "medium", "Multiple similar active marks found"
+    if top_score >= 5.0 and top_active:
+        return "medium", "Strong similar mark found"
+
+    return "low", "Only weak or inactive matches found"
 
 
 def country_available(con: sqlite3.Connection, country: str) -> bool:
@@ -647,6 +709,20 @@ def rank_mark(match: dict[str, Any], term_norm: str, reference_classes: list[str
         sim,
         overlap,
     )
+
+
+def prioritize_exact_matches(matches: list[dict[str, Any]], term_norm: str, reference_classes: list[str]) -> list[dict[str, Any]]:
+    def key(match: dict[str, Any]) -> tuple:
+        mark_norm = norm_text(match.get("mark_text", ""))
+        exact = mark_norm == term_norm
+        same_class = bool(reference_classes and (set(match.get("class_codes", [])) & set(reference_classes)))
+        return (
+            1 if exact and same_class else 0,
+            1 if exact else 0,
+            rank_mark(match, term_norm, reference_classes),
+        )
+
+    return sorted(matches, key=key, reverse=True)
 
 
 def split_mark_groups(matches: list[dict[str, Any]], reference_classes: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -771,14 +847,16 @@ def check():
         match["data_source"] = result_source if result_source != "local_database" else "local_database"
 
     reference_classes = determine_reference_classes(matches, class_filter, term_norm)
-    matches.sort(key=lambda m: rank_mark(m, term_norm, reference_classes), reverse=True)
+    matches = prioritize_exact_matches(matches, term_norm, reference_classes)
 
     # Keep top 50
     matches = matches[:50]
     chosen_class_matches, cross_class_matches = split_mark_groups(matches, reference_classes)
+    chosen_class_matches = prioritize_exact_matches(chosen_class_matches, term_norm, reference_classes)
+    cross_class_matches = prioritize_exact_matches(cross_class_matches, term_norm, reference_classes)
     matches = chosen_class_matches + cross_class_matches
 
-    risk = score_risk(matches, reference_classes)
+    risk, risk_explanation = score_risk(matches, reference_classes, term_norm)
 
     patents = [summarize_patent(r, term_norm) for r in patent_rows]
     patents.sort(key=lambda p: (p["active"], p["similarity"]), reverse=True)
@@ -808,6 +886,7 @@ def check():
             "country": country,
             "classes": class_filter,
             "risk_level": risk,
+            "risk_explanation": risk_explanation,
             "result_source": result_source,
             "fallback_used": fallback_used,
             "fallback_error": fallback_error,
