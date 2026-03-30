@@ -339,6 +339,7 @@ def ingest_file(con: sqlite3.Connection, path: Path) -> None:
     headers = None
     batch = []
     total = 0
+    is_uk_domestic_export = path.name in {"OpenDataDomestic.txt", "OpenDataDomestic 2.txt"}
 
     for row in read_rows(path):
         if headers is None:
@@ -354,7 +355,7 @@ def ingest_file(con: sqlite3.Connection, path: Path) -> None:
         reg_no = (data.get("Trade Mark") or "").strip()
         mark_text = (data.get("Mark Text") or "").strip()
         owner_name = (data.get("Name") or "").strip()
-        country = (data.get("Country") or "").strip()
+        country = "United Kingdom" if is_uk_domestic_export else (data.get("Country") or "").strip()
         status = (data.get("Status") or "").strip()
         category = (data.get("Category of Mark") or "").strip()
         mark_type = (data.get("Mark Type") or "").strip()
@@ -570,7 +571,9 @@ def ingest_journal_xml(con: sqlite3.Connection, path: Path) -> None:
 
             mark_text_norm = norm_text(mark_text)
             owner_type = infer_owner_type(applicant)
-            country = normalize_country_from_office(reg_no, office_code)
+            # UKIPO export files represent the UK register. Applicant nationality
+            # should not control jurisdiction filtering for the UK-only checker.
+            country = "United Kingdom"
 
             batch.append(
                 (

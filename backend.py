@@ -20,6 +20,7 @@ from services.ukipo_fallback import UKIPOFallbackService
 
 DB_PATH = Path(os.getenv("TRADEMARK_DB_PATH", "data/trademarks.sqlite"))
 DB_URL = os.getenv("TRADEMARK_DB_URL", "").strip()
+SUPPLEMENTAL_MARKS_PATH = Path(os.getenv("SUPPLEMENTAL_MARKS_PATH", "data/supplemental_marks.json"))
 ENABLE_UKIPO_FALLBACK = os.getenv("ENABLE_UKIPO_FALLBACK", "0") == "1"
 ENABLE_LOCAL_SIMILARITY = os.getenv("ENABLE_LOCAL_SIMILARITY", "1") == "1"
 UKIPO_FALLBACK_TIMEOUT = int(os.getenv("UKIPO_FALLBACK_TIMEOUT", "10"))
@@ -27,6 +28,8 @@ UKIPO_FALLBACK_LIMIT = int(os.getenv("UKIPO_FALLBACK_LIMIT", "10"))
 UKIPO_FALLBACK_CACHE_DAYS = int(os.getenv("UKIPO_FALLBACK_CACHE_DAYS", "14"))
 _download_lock = threading.Lock()
 _download_attempted = False
+_supplemental_marks_cache: list[dict[str, Any]] | None = None
+_supplemental_marks_mtime: float | None = None
 
 app = Flask(__name__)
 ukipo_fallback_service = UKIPOFallbackService(timeout_seconds=UKIPO_FALLBACK_TIMEOUT)
@@ -340,6 +343,41 @@ def ensure_runtime_schema(con: sqlite3.Connection) -> None:
     con.commit()
 
 
+def load_supplemental_marks() -> list[dict[str, Any]]:
+    global _supplemental_marks_cache, _supplemental_marks_mtime
+
+    if not SUPPLEMENTAL_MARKS_PATH.exists():
+        _supplemental_marks_cache = []
+        _supplemental_marks_mtime = None
+        return []
+
+    mtime = SUPPLEMENTAL_MARKS_PATH.stat().st_mtime
+    if _supplemental_marks_cache is not None and _supplemental_marks_mtime == mtime:
+        return _supplemental_marks_cache
+
+    try:
+        payload = json.loads(SUPPLEMENTAL_MARKS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        _supplemental_marks_cache = []
+        _supplemental_marks_mtime = mtime
+        return []
+
+    records = payload if isinstance(payload, list) else payload.get("marks", [])
+    cleaned: list[dict[str, Any]] = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        mark_text = (item.get("mark_text") or "").strip()
+        reg_no = (item.get("reg_no") or "").strip()
+        if not mark_text or not reg_no:
+            continue
+        cleaned.append(item)
+
+    _supplemental_marks_cache = cleaned
+    _supplemental_marks_mtime = mtime
+    return cleaned
+
+
 def resolve_countries(country: str) -> list[str]:
     c = (country or "").strip().lower()
     if c in {"all", "all countries", "any"}:
@@ -464,6 +502,74 @@ def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limi
         reverse=True,
     )
     return ranked[:limit]
+
+
+def summarize_supplemental_mark(item: dict[str, Any], term_norm: str) -> dict[str, Any]:
+    mark_text = (item.get("mark_text") or "").strip()
+    mark_norm = norm_text(mark_text)
+    expired = item.get("expired", "") or ""
+    filed = item.get("filed", "") or ""
+    class_codes = item.get("class_codes") or []
+    if isinstance(class_codes, str):
+        class_codes = [c for c in class_codes.split(",") if c]
+
+    return {
+        "reg_no": item.get("reg_no", ""),
+        "mark_text": mark_text,
+        "owner_name": item.get("owner_name", ""),
+        "owner_type": item.get("owner_type") or infer_owner_type(item.get("owner_name", "")),
+        "country": item.get("country", "United Kingdom"),
+        "status": item.get("status", ""),
+        "status_display": status_display(item.get("status", ""), expired),
+        "category": item.get("category", ""),
+        "mark_type": item.get("mark_type", "Word"),
+        "filed": filed,
+        "registered": item.get("registered", ""),
+        "expired": expired,
+        "renewal_due": item.get("renewal_due", ""),
+        "age_years": years_since(filed) if filed else None,
+        "active": is_active(item.get("status", ""), expired),
+        "class_codes": class_codes,
+        "goods_services": item.get("goods_services", ""),
+        "source_url": item.get("source_url", ""),
+        "data_source": "supplemental_source",
+        "similarity": round(local_similarity_score(term_norm, mark_norm), 4),
+    }
+
+
+def has_exact_or_strong_result(matches: list[dict[str, Any]], term_norm: str) -> bool:
+    for match in matches:
+        mark_norm = norm_text(match.get("mark_text", ""))
+        sim = float(match.get("similarity", 0.0))
+        if mark_norm == term_norm:
+            return True
+        if sim >= 0.92:
+            return True
+        if is_close_phrase_match(term_norm, mark_norm, sim):
+            return True
+    return False
+
+
+def query_supplemental_candidates(term_norm: str, country: str, limit: int = 10) -> list[dict[str, Any]]:
+    countries = resolve_countries(country)
+    records = load_supplemental_marks()
+    matches: list[dict[str, Any]] = []
+
+    for item in records:
+        item_country = item.get("country", "United Kingdom")
+        if item_country not in countries:
+            continue
+
+        mark_norm = norm_text(item.get("mark_text", ""))
+        if not mark_norm:
+            continue
+
+        sim = local_similarity_score(term_norm, mark_norm)
+        if mark_norm == term_norm or sim >= 0.86 or term_norm in mark_norm or mark_norm in term_norm:
+            matches.append(summarize_supplemental_mark(item, term_norm))
+
+    matches.sort(key=lambda m: (m.get("active"), m.get("similarity", 0.0)), reverse=True)
+    return matches[:limit]
 
 
 def _cache_is_fresh(fetched_at: str) -> bool:
@@ -875,6 +981,19 @@ def check():
     matches = [summarize_mark(r, term_norm) for r in rows]
     for match in matches:
         match["data_source"] = result_source if result_source != "local_database" else "local_database"
+
+    if not has_exact_or_strong_result(matches, term_norm):
+        supplemental_matches = query_supplemental_candidates(term_norm, country)
+        if supplemental_matches:
+            seen_reg_nos = {m.get("reg_no", "") for m in matches}
+            for supplemental_match in supplemental_matches:
+                reg_no = supplemental_match.get("reg_no", "")
+                if reg_no in seen_reg_nos:
+                    continue
+                matches.append(supplemental_match)
+                seen_reg_nos.add(reg_no)
+            if not rows:
+                result_source = "supplemental_source"
 
     reference_classes = determine_reference_classes(matches, class_filter, term_norm)
     matches = prioritize_exact_matches(matches, term_norm, reference_classes)
