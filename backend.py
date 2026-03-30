@@ -359,6 +359,16 @@ def resolve_countries(country: str) -> list[str]:
 
 def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limit: int = 25) -> list[sqlite3.Row]:
     countries = resolve_countries(country)
+    expanded_countries: list[str] = []
+    for value in countries:
+        if value not in expanded_countries:
+            expanded_countries.append(value)
+        # Keep retrieval tolerant of the country labels currently stored in
+        # the DB without changing the API contract.
+        if value == "United States" and "United States of America" not in expanded_countries:
+            expanded_countries.append("United States of America")
+
+    countries = expanded_countries
     placeholders = ",".join(["?"] * len(countries))
     candidates: list[sqlite3.Row] = []
     seen_ids: set[int] = set()
@@ -405,7 +415,13 @@ def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limi
     # each with its own LIMIT. We avoid the broad multi-token OR queries that
     # previously caused worker timeouts.
     if ENABLE_LOCAL_SIMILARITY:
-        for token in significant_tokens(term_norm):
+        fts_tokens = significant_tokens(term_norm)
+        if not fts_tokens:
+            raw_tokens = tokenize(term_norm)
+            if len(raw_tokens) == 1 and len(raw_tokens[0]) >= 4:
+                fts_tokens = [raw_tokens[0]]
+
+        for token in fts_tokens:
             try:
                 rows = con.execute(
                     """
@@ -421,6 +437,20 @@ def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limi
             except sqlite3.OperationalError:
                 rows = []
             add_rows(rows)
+
+    # 4) Safe case-insensitive fallback on the original mark text.
+    if not candidates and term_norm:
+        rows = con.execute(
+            """
+            SELECT m.*
+            FROM marks m
+            WHERE m.country IN (""" + placeholders + """)
+              AND lower(m.mark_text) LIKE ?
+            LIMIT ?
+            """,
+            (*countries, f"%{term_norm}%", limit),
+        ).fetchall()
+        add_rows(rows)
 
     if not candidates:
         return []
@@ -866,6 +896,7 @@ def check():
 
     if not matches:
         result_source = "no_match"
+        uk_only = resolve_countries(country) == ["United Kingdom"]
         if fallback_allowed(country) and fallback_error:
             warnings.append(
                 "No local match was found, and the live UKIPO fallback is temporarily unavailable. "
@@ -873,11 +904,13 @@ def check():
             )
         elif fallback_allowed(country):
             warnings.append(
-                "No local or cached match was found for this exact term."
+                "No matches were found in the UK. Similar marks may still exist in other countries."
             )
         else:
             warnings.append(
-                "No local match was found for this exact term."
+                "No matches were found in the UK. Similar marks may still exist in other countries."
+                if uk_only
+                else "No local match was found for this exact term."
             )
 
     return jsonify(
