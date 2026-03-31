@@ -54,11 +54,44 @@ else:
     CORS(app)
 
 
+def normalize_text(text: str) -> str:
+    text = (text or "").lower()
+    text = text.replace("’", "'")
+    text = text.replace("'", "")
+    text = text.replace("-", " ")
+    text = re.sub(r"[^a-z0-9 ]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def norm_text(s: str) -> str:
-    s = (s or "").lower()
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    return normalize_text(s)
+
+
+def _sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def normalized_mark_sql(column: str = "m.mark_text") -> str:
+    expr = f"lower(coalesce({column}, ''))"
+    for old, new in [
+        ("’", "'"),
+        ("'", ""),
+        ("-", " "),
+        (".", " "),
+        (",", " "),
+        ("/", " "),
+        ("&", " "),
+        ("(", " "),
+        (")", " "),
+        (":", " "),
+        (";", " "),
+        ('"', " "),
+    ]:
+        expr = f"replace({expr}, {_sql_literal(old)}, {_sql_literal(new)})"
+    for _ in range(4):
+        expr = f"replace({expr}, '  ', ' ')"
+    return f"trim({expr})"
 
 
 def parse_classes(s: str) -> list[str]:
@@ -408,6 +441,7 @@ def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limi
 
     countries = expanded_countries
     placeholders = ",".join(["?"] * len(countries))
+    normalized_sql = normalized_mark_sql("m.mark_text")
     candidates: list[sqlite3.Row] = []
     seen_ids: set[int] = set()
 
@@ -425,10 +459,13 @@ def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limi
         SELECT m.*
         FROM marks m
         WHERE m.country IN (""" + placeholders + """)
-          AND m.mark_text_norm = ?
+          AND (
+                m.mark_text_norm = ?
+                OR """ + normalized_sql + """ = ?
+          )
         LIMIT ?
         """,
-        (*countries, term_norm, limit),
+        (*countries, term_norm, term_norm, limit),
     ).fetchall()
     add_rows(rows)
 
@@ -440,10 +477,13 @@ def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limi
             SELECT m.*
             FROM marks m
             WHERE m.country IN (""" + placeholders + """)
-              AND m.mark_text_norm LIKE ?
+              AND (
+                    m.mark_text_norm LIKE ?
+                    OR """ + normalized_sql + """ LIKE ?
+              )
             LIMIT ?
             """,
-            (*countries, like, limit),
+            (*countries, like, like, limit),
         ).fetchall()
         add_rows(rows)
 
@@ -483,7 +523,7 @@ def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limi
             SELECT m.*
             FROM marks m
             WHERE m.country IN (""" + placeholders + """)
-              AND lower(m.mark_text) LIKE ?
+              AND """ + normalized_sql + """ LIKE ?
             LIMIT ?
             """,
             (*countries, f"%{term_norm}%", limit),
@@ -939,7 +979,7 @@ def check():
     if len(term.strip()) < 3:
         return jsonify({"error": "Please enter at least 3 characters."}), 400
 
-    term_norm = norm_text(term)
+    term_norm = normalize_text(term)
     con = open_db()
     if not country_available(con, country) and not fallback_allowed(country):
         con.close()
