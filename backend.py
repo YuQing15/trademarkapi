@@ -117,6 +117,26 @@ def search_norm_variants(term: str, term_norm: str) -> list[str]:
     for candidate in [term_norm, db_norm_text(term)]:
         if candidate and candidate not in variants:
             variants.append(candidate)
+
+    # Keep search aligned with existing stored mark_text_norm values that were
+    # built by replacing punctuation with spaces. This lets plain inputs like
+    # "gails" also match stored norms such as "gail s" without rebuilding the DB.
+    extra_variants: list[str] = []
+    for candidate in list(variants):
+        if " " not in candidate and len(candidate) > 2 and candidate.endswith("s"):
+            extra_variants.append(candidate[:-1] + " s")
+        tokens = candidate.split()
+        for i, token in enumerate(tokens):
+            if len(token) > 2 and token.endswith("s"):
+                split_tokens = tokens[:]
+                split_tokens[i] = token[:-1]
+                split_tokens.insert(i + 1, "s")
+                extra_variants.append(" ".join(split_tokens))
+
+    for candidate in extra_variants:
+        candidate = re.sub(r"\s+", " ", candidate).strip()
+        if candidate and candidate not in variants:
+            variants.append(candidate)
     return variants
 
 
