@@ -718,6 +718,10 @@ def has_exact_or_strong_result(matches: list[dict[str, Any]], term_norm: str) ->
     return False
 
 
+def has_exact_result(matches: list[dict[str, Any]], term_norm: str) -> bool:
+    return any(norm_text(match.get("mark_text", "")) == term_norm for match in matches)
+
+
 def query_supplemental_candidates(
     term_norm: str,
     country: str,
@@ -1039,6 +1043,39 @@ def prioritize_exact_matches(matches: list[dict[str, Any]], term_norm: str, refe
     return sorted(matches, key=key, reverse=True)
 
 
+def shortlist_relevant_matches(
+    matches: list[dict[str, Any]],
+    term_norm: str,
+    reference_classes: list[str],
+    max_results: int = 10,
+) -> list[dict[str, Any]]:
+    ranked = prioritize_exact_matches(matches, term_norm, reference_classes)
+    shortlisted: list[dict[str, Any]] = []
+
+    for match in ranked:
+        mark_norm = norm_text(match.get("mark_text", ""))
+        sim = float(match.get("similarity", 0.0))
+        overlap = token_overlap_ratio(term_norm, mark_norm)
+        close_phrase = is_close_phrase_match(term_norm, mark_norm, sim)
+        same_class = bool(reference_classes and (set(match.get("class_codes", [])) & set(reference_classes)))
+        keep = (
+            mark_norm == term_norm
+            or close_phrase
+            or (same_class and sim >= 0.72)
+            or (overlap >= 0.5 and sim >= 0.7)
+            or (len(tokenize(term_norm)) == 1 and sim >= 0.82)
+        )
+        if keep:
+            shortlisted.append(match)
+        if len(shortlisted) >= max_results:
+            break
+
+    if shortlisted:
+        return shortlisted
+
+    return ranked[: min(max_results, 5)]
+
+
 def split_mark_groups(matches: list[dict[str, Any]], reference_classes: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     ref_set = set(reference_classes)
 
@@ -1222,9 +1259,10 @@ def check():
 
     reference_classes = determine_reference_classes(matches, class_filter, term_norm)
     matches = prioritize_exact_matches(matches, term_norm, reference_classes)
-
-    # Keep top 50
-    matches = matches[:50]
+    if has_exact_result(matches, term_norm):
+        matches = matches[:50]
+    else:
+        matches = shortlist_relevant_matches(matches, term_norm, reference_classes, max_results=10)
     chosen_class_matches, cross_class_matches = split_mark_groups(matches, reference_classes)
     chosen_class_matches = prioritize_exact_matches(chosen_class_matches, term_norm, reference_classes)
     cross_class_matches = prioritize_exact_matches(cross_class_matches, term_norm, reference_classes)
