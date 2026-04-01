@@ -10,6 +10,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, date
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 from difflib import SequenceMatcher
 
@@ -26,6 +27,9 @@ ENABLE_LOCAL_SIMILARITY = os.getenv("ENABLE_LOCAL_SIMILARITY", "1") == "1"
 UKIPO_FALLBACK_TIMEOUT = int(os.getenv("UKIPO_FALLBACK_TIMEOUT", "10"))
 UKIPO_FALLBACK_LIMIT = int(os.getenv("UKIPO_FALLBACK_LIMIT", "10"))
 UKIPO_FALLBACK_CACHE_DAYS = int(os.getenv("UKIPO_FALLBACK_CACHE_DAYS", "14"))
+MAX_SQL_CANDIDATES = max(20, int(os.getenv("MAX_SQL_CANDIDATES", "40")))
+MAX_PYTHON_SCORE_ROWS = max(5, int(os.getenv("MAX_PYTHON_SCORE_ROWS", "15")))
+HIGH_SIMILARITY_CUTOFF = float(os.getenv("HIGH_SIMILARITY_CUTOFF", "0.9"))
 _download_lock = threading.Lock()
 _download_attempted = False
 _supplemental_marks_cache: list[dict[str, Any]] | None = None
@@ -92,6 +96,32 @@ def normalized_mark_sql(column: str = "m.mark_text") -> str:
     for _ in range(4):
         expr = f"replace({expr}, '  ', ' ')"
     return f"trim({expr})"
+
+
+def db_norm_text(text: str) -> str:
+    text = (text or "").lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def needs_runtime_normalized_search(term: str) -> bool:
+    raw = (term or "").strip()
+    if not raw:
+        return False
+    return raw != normalize_text(raw)
+
+
+def search_norm_variants(term: str, term_norm: str) -> list[str]:
+    variants: list[str] = []
+    for candidate in [term_norm, db_norm_text(term)]:
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+    return variants
+
+
+def prefix_upper_bound(prefix: str) -> str:
+    return prefix + "\uffff"
 
 
 def parse_classes(s: str) -> list[str]:
@@ -373,6 +403,10 @@ def ensure_runtime_schema(con: sqlite3.Connection) -> None:
     )
     con.execute("CREATE INDEX IF NOT EXISTS idx_fallback_query_norm ON fallback_cache(query_norm)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_fallback_reg_no ON fallback_cache(reg_no)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_marks_mark_norm ON marks(mark_text_norm)")
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_marks_country_mark_text_norm ON marks(country, mark_text_norm)"
+    )
     con.commit()
 
 
@@ -428,24 +462,48 @@ def resolve_countries(country: str) -> list[str]:
     return [country]
 
 
-def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limit: int = 25) -> list[sqlite3.Row]:
+def expanded_countries_for_query(country: str) -> list[str]:
     countries = resolve_countries(country)
     expanded_countries: list[str] = []
     for value in countries:
         if value not in expanded_countries:
             expanded_countries.append(value)
-        # Keep retrieval tolerant of the country labels currently stored in
-        # the DB without changing the API contract.
         if value == "United States" and "United States of America" not in expanded_countries:
             expanded_countries.append("United States of America")
+    return expanded_countries
 
-    countries = expanded_countries
+
+def query_exact_candidates(
+    con: sqlite3.Connection,
+    term: str,
+    term_norm: str,
+    country: str,
+    limit: int = 25,
+) -> tuple[list[sqlite3.Row], dict[str, float]]:
+    countries = expanded_countries_for_query(country)
     placeholders = ",".join(["?"] * len(countries))
-    normalized_sql = normalized_mark_sql("m.mark_text")
+    variants = search_norm_variants(term, term_norm)
     candidates: list[sqlite3.Row] = []
     seen_ids: set[int] = set()
+    timings = {"exact_sql_ms": 0.0, "punctuation_exact_ms": 0.0}
 
-    def add_rows(rows: list[sqlite3.Row]) -> None:
+    for variant in variants:
+        start = perf_counter()
+        rows = con.execute(
+            """
+            SELECT m.*
+            FROM marks m
+            WHERE m.country IN (""" + placeholders + """)
+              AND m.mark_text_norm = ?
+            LIMIT ?
+            """,
+            (*countries, variant, min(limit, 10)),
+        ).fetchall()
+        elapsed_ms = (perf_counter() - start) * 1000
+        if variant == term_norm:
+            timings["exact_sql_ms"] += elapsed_ms
+        else:
+            timings["punctuation_exact_ms"] += elapsed_ms
         for row in rows:
             row_id = row["id"]
             if row_id in seen_ids:
@@ -453,54 +511,123 @@ def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limi
             seen_ids.add(row_id)
             candidates.append(row)
 
-    # 1) Exact match (fast)
-    rows = con.execute(
-        """
-        SELECT m.*
-        FROM marks m
-        WHERE m.country IN (""" + placeholders + """)
-          AND (
-                m.mark_text_norm = ?
-                OR """ + normalized_sql + """ = ?
-          )
-        LIMIT ?
-        """,
-        (*countries, term_norm, term_norm, limit),
-    ).fetchall()
-    add_rows(rows)
+    return candidates[:limit], timings
 
-    # 2) Prefix match only (fast, index-friendly)
-    if len(term_norm) >= 4:
-        like = f"{term_norm}%"
+
+def query_candidates(
+    con: sqlite3.Connection,
+    term: str,
+    term_norm: str,
+    country: str,
+    limit: int = 25,
+) -> tuple[list[sqlite3.Row], dict[str, float]]:
+    countries = expanded_countries_for_query(country)
+    placeholders = ",".join(["?"] * len(countries))
+    variants = search_norm_variants(term, term_norm)
+    punctuation_fast_path = needs_runtime_normalized_search(term)
+    candidates: list[sqlite3.Row] = []
+    seen_ids: set[int] = set()
+    max_candidates = min(max(limit, 1), MAX_SQL_CANDIDATES)
+    timings = {
+        "exact_sql_ms": 0.0,
+        "punctuation_exact_ms": 0.0,
+        "punctuation_prefix_ms": 0.0,
+        "fts_ms": 0.0,
+        "python_scoring_ms": 0.0,
+    }
+
+    def add_rows(rows: list[sqlite3.Row]) -> None:
+        for row in rows:
+            if len(candidates) >= max_candidates:
+                break
+            row_id = row["id"]
+            if row_id in seen_ids:
+                continue
+            seen_ids.add(row_id)
+            candidates.append(row)
+
+    def rank_rows(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+        start = perf_counter()
+        shortlist = rows[:MAX_PYTHON_SCORE_ROWS]
+        ranked = sorted(
+            shortlist,
+            key=lambda row: (
+                is_active(row["status"], row["expired"]),
+                row["mark_text_norm"] == term_norm,
+                local_similarity_score(term_norm, row["mark_text_norm"] or ""),
+            ),
+            reverse=True,
+        )
+        timings["python_scoring_ms"] += (perf_counter() - start) * 1000
+        return ranked[:limit]
+
+    def has_high_similarity(rows: list[sqlite3.Row]) -> bool:
+        for row in rows[:MAX_PYTHON_SCORE_ROWS]:
+            if local_similarity_score(term_norm, row["mark_text_norm"] or "") >= HIGH_SIMILARITY_CUTOFF:
+                return True
+        return False
+
+    # 1) Exact normalized match (fast, index-friendly)
+    for variant in variants:
+        start = perf_counter()
         rows = con.execute(
             """
             SELECT m.*
             FROM marks m
             WHERE m.country IN (""" + placeholders + """)
-              AND (
-                    m.mark_text_norm LIKE ?
-                    OR """ + normalized_sql + """ LIKE ?
-              )
+              AND m.mark_text_norm = ?
             LIMIT ?
             """,
-            (*countries, like, like, limit),
+            (*countries, variant, min(limit, max_candidates)),
         ).fetchall()
+        elapsed_ms = (perf_counter() - start) * 1000
+        if variant == term_norm:
+            timings["exact_sql_ms"] += elapsed_ms
+        else:
+            timings["punctuation_exact_ms"] += elapsed_ms
         add_rows(rows)
+        if candidates:
+            return rank_rows(candidates), timings
+
+    # 2) Prefix match only (fast, index-friendly)
+    for variant in variants:
+        if len(variant) < 4:
+            continue
+        upper = prefix_upper_bound(variant)
+        start = perf_counter()
+        rows = con.execute(
+            """
+            SELECT m.*
+            FROM marks m
+            WHERE m.country IN (""" + placeholders + """)
+              AND m.mark_text_norm >= ?
+              AND m.mark_text_norm < ?
+            LIMIT ?
+            """,
+            (*countries, variant, upper, min(max_candidates, 12)),
+        ).fetchall()
+        timings["punctuation_prefix_ms"] += (perf_counter() - start) * 1000
+        add_rows(rows)
+        if candidates and has_high_similarity(candidates):
+            return rank_rows(candidates), timings
+
+    if punctuation_fast_path and candidates:
+        return rank_rows(candidates), timings
+
+    if punctuation_fast_path:
+        return [], timings
 
     # 3) Bounded token-prefix FTS search.
-    #
-    # This stays cheap on Render by querying at most two significant tokens,
-    # each with its own LIMIT. We avoid the broad multi-token OR queries that
-    # previously caused worker timeouts.
     if ENABLE_LOCAL_SIMILARITY:
-        fts_tokens = significant_tokens(term_norm)
+        fts_tokens = significant_tokens(variants[0] if variants else term_norm)
         if not fts_tokens:
-            raw_tokens = tokenize(term_norm)
+            raw_tokens = tokenize(variants[0] if variants else term_norm)
             if len(raw_tokens) == 1 and len(raw_tokens[0]) >= 4:
                 fts_tokens = [raw_tokens[0]]
 
-        for token in fts_tokens:
+        for token in fts_tokens[:1]:
             try:
+                start = perf_counter()
                 rows = con.execute(
                     """
                     SELECT m.*
@@ -510,38 +637,19 @@ def query_candidates(con: sqlite3.Connection, term_norm: str, country: str, limi
                       AND f.mark_text MATCH ?
                     LIMIT ?
                     """,
-                    (*countries, f"{token}*", max(limit, 20)),
+                    (*countries, f"{token}*", min(max_candidates, 10)),
                 ).fetchall()
+                timings["fts_ms"] += (perf_counter() - start) * 1000
             except sqlite3.OperationalError:
                 rows = []
             add_rows(rows)
-
-    # 4) Safe case-insensitive fallback on the original mark text.
-    if not candidates and term_norm:
-        rows = con.execute(
-            """
-            SELECT m.*
-            FROM marks m
-            WHERE m.country IN (""" + placeholders + """)
-              AND """ + normalized_sql + """ LIKE ?
-            LIMIT ?
-            """,
-            (*countries, f"%{term_norm}%", limit),
-        ).fetchall()
-        add_rows(rows)
+            if has_high_similarity(candidates) or len(candidates) >= max_candidates:
+                break
 
     if not candidates:
-        return []
+        return [], timings
 
-    ranked = sorted(
-        candidates,
-        key=lambda row: (
-            is_active(row["status"], row["expired"]),
-            local_similarity_score(term_norm, row["mark_text_norm"] or ""),
-        ),
-        reverse=True,
-    )
-    return ranked[:limit]
+    return rank_rows(candidates), timings
 
 
 def summarize_supplemental_mark(item: dict[str, Any], term_norm: str) -> dict[str, Any]:
@@ -590,7 +698,12 @@ def has_exact_or_strong_result(matches: list[dict[str, Any]], term_norm: str) ->
     return False
 
 
-def query_supplemental_candidates(term_norm: str, country: str, limit: int = 10) -> list[dict[str, Any]]:
+def query_supplemental_candidates(
+    term_norm: str,
+    country: str,
+    limit: int = 10,
+    exact_only: bool = False,
+) -> list[dict[str, Any]]:
     countries = resolve_countries(country)
     records = load_supplemental_marks()
     matches: list[dict[str, Any]] = []
@@ -605,6 +718,11 @@ def query_supplemental_candidates(term_norm: str, country: str, limit: int = 10)
             continue
 
         sim = local_similarity_score(term_norm, mark_norm)
+        if exact_only:
+            if mark_norm == term_norm:
+                matches.append(summarize_supplemental_mark(item, term_norm))
+            continue
+
         if mark_norm == term_norm or sim >= 0.86 or term_norm in mark_norm or mark_norm in term_norm:
             matches.append(summarize_supplemental_mark(item, term_norm))
 
@@ -962,6 +1080,7 @@ def index():
 
 @app.route("/check", methods=["POST"])
 def check():
+    request_started = perf_counter()
     ok, msg = ensure_index()
     if not ok:
         return jsonify({"error": msg}), 400
@@ -989,13 +1108,42 @@ def check():
                 "country": country,
             }
         ), 400
-    rows = query_candidates(con, term_norm, country)
+    stage_timings = {
+        "exact_sql_ms": 0.0,
+        "punctuation_exact_ms": 0.0,
+        "punctuation_prefix_ms": 0.0,
+        "fts_ms": 0.0,
+        "python_scoring_ms": 0.0,
+        "supplemental_lookup_ms": 0.0,
+        "total_request_ms": 0.0,
+    }
+
+    exact_rows, exact_timings = query_exact_candidates(con, term, term_norm, country)
+    for key, value in exact_timings.items():
+        stage_timings[key] += value
+
     result_source = "local_database"
     fallback_used = False
     fallback_error = ""
     warnings: list[str] = []
+    rows: list[sqlite3.Row] = []
 
-    if not rows and fallback_allowed(country):
+    supplemental_matches: list[dict[str, Any]] = []
+    supplemental_start = perf_counter()
+    if not exact_rows:
+        supplemental_matches = query_supplemental_candidates(term_norm, country, exact_only=True)
+    stage_timings["supplemental_lookup_ms"] += (perf_counter() - supplemental_start) * 1000
+
+    if exact_rows:
+        rows = exact_rows
+    elif supplemental_matches:
+        result_source = "supplemental_source"
+    else:
+        rows, query_timings = query_candidates(con, term, term_norm, country)
+        for key, value in query_timings.items():
+            stage_timings[key] += value
+
+    if not rows and not supplemental_matches and fallback_allowed(country):
         cached_rows = query_fallback_cache(con, term_norm, limit=UKIPO_FALLBACK_LIMIT)
         if cached_rows:
             rows = cached_rows
@@ -1023,7 +1171,10 @@ def check():
         match["data_source"] = result_source if result_source != "local_database" else "local_database"
 
     if not has_exact_or_strong_result(matches, term_norm):
-        supplemental_matches = query_supplemental_candidates(term_norm, country)
+        if not supplemental_matches:
+            supplemental_start = perf_counter()
+            supplemental_matches = query_supplemental_candidates(term_norm, country)
+            stage_timings["supplemental_lookup_ms"] += (perf_counter() - supplemental_start) * 1000
         if supplemental_matches:
             seen_reg_nos = {m.get("reg_no", "") for m in matches}
             for supplemental_match in supplemental_matches:
@@ -1034,6 +1185,20 @@ def check():
                 seen_reg_nos.add(reg_no)
             if not rows:
                 result_source = "supplemental_source"
+
+    stage_timings["total_request_ms"] = (perf_counter() - request_started) * 1000
+    app.logger.info(
+        "check timing trademark=%r punctuation_fast=%s exact_sql=%.1fms punctuation_exact=%.1fms punctuation_prefix=%.1fms fts=%.1fms python_scoring=%.1fms supplemental=%.1fms total=%.1fms",
+        term,
+        needs_runtime_normalized_search(term),
+        stage_timings["exact_sql_ms"],
+        stage_timings["punctuation_exact_ms"],
+        stage_timings["punctuation_prefix_ms"],
+        stage_timings["fts_ms"],
+        stage_timings["python_scoring_ms"],
+        stage_timings["supplemental_lookup_ms"],
+        stage_timings["total_request_ms"],
+    )
 
     reference_classes = determine_reference_classes(matches, class_filter, term_norm)
     matches = prioritize_exact_matches(matches, term_norm, reference_classes)
