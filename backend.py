@@ -1050,30 +1050,46 @@ def shortlist_relevant_matches(
     max_results: int = 10,
 ) -> list[dict[str, Any]]:
     ranked = prioritize_exact_matches(matches, term_norm, reference_classes)
-    shortlisted: list[dict[str, Any]] = []
+    target_results = min(max_results, 10)
+    minimum_results = min(5, len(ranked))
 
-    for match in ranked:
+    def relevance_key(match: dict[str, Any]) -> tuple:
         mark_norm = norm_text(match.get("mark_text", ""))
         sim = float(match.get("similarity", 0.0))
         overlap = token_overlap_ratio(term_norm, mark_norm)
-        close_phrase = is_close_phrase_match(term_norm, mark_norm, sim)
         same_class = bool(reference_classes and (set(match.get("class_codes", [])) & set(reference_classes)))
-        keep = (
-            mark_norm == term_norm
-            or close_phrase
-            or (same_class and sim >= 0.72)
-            or (overlap >= 0.5 and sim >= 0.7)
-            or (len(tokenize(term_norm)) == 1 and sim >= 0.82)
+        prefix = mark_norm.startswith(term_norm) or term_norm.startswith(mark_norm)
+        shared_token = overlap > 0
+        close_phrase = is_close_phrase_match(term_norm, mark_norm, sim)
+        weak_penalty = 1 if (sim < 0.45 and overlap == 0 and not prefix) else 0
+        return (
+            1 if same_class else 0,
+            1 if shared_token else 0,
+            1 if prefix else 0,
+            1 if close_phrase else 0,
+            1 if match.get("active") else 0,
+            sim,
+            overlap,
+            -weak_penalty,
         )
-        if keep:
+
+    reranked = sorted(ranked, key=relevance_key, reverse=True)
+    shortlisted: list[dict[str, Any]] = []
+
+    for match in reranked:
+        mark_norm = norm_text(match.get("mark_text", ""))
+        sim = float(match.get("similarity", 0.0))
+        overlap = token_overlap_ratio(term_norm, mark_norm)
+        same_class = bool(reference_classes and (set(match.get("class_codes", [])) & set(reference_classes)))
+        prefix = mark_norm.startswith(term_norm) or term_norm.startswith(mark_norm)
+        shared_token = overlap > 0
+        keep = same_class or shared_token or prefix or sim >= 0.55
+        if keep or len(shortlisted) < minimum_results:
             shortlisted.append(match)
-        if len(shortlisted) >= max_results:
+        if len(shortlisted) >= target_results:
             break
 
-    if shortlisted:
-        return shortlisted
-
-    return ranked[: min(max_results, 5)]
+    return shortlisted or reranked[:minimum_results]
 
 
 def split_mark_groups(matches: list[dict[str, Any]], reference_classes: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
