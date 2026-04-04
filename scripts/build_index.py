@@ -182,6 +182,7 @@ def setup_schema(con: sqlite3.Connection) -> None:
     con.execute("CREATE INDEX IF NOT EXISTS idx_marks_country ON marks(country)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_marks_status ON marks(status)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_marks_mark_norm ON marks(mark_text_norm)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_marks_country_mark_text_norm ON marks(country, mark_text_norm)")
     con.execute(
         """
         CREATE VIRTUAL TABLE IF NOT EXISTS marks_fts

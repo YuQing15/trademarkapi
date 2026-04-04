@@ -35,6 +35,8 @@ _download_lock = threading.Lock()
 _download_attempted = False
 _supplemental_marks_cache: list[dict[str, Any]] | None = None
 _supplemental_marks_mtime: float | None = None
+_runtime_schema_lock = threading.Lock()
+_runtime_schema_mtime: float | None = None
 
 app = Flask(__name__)
 ukipo_fallback_service = UKIPOFallbackService(timeout_seconds=UKIPO_FALLBACK_TIMEOUT)
@@ -409,40 +411,52 @@ def ensure_runtime_schema(con: sqlite3.Connection) -> None:
     UKIPO for the same exact term.
     """
 
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS fallback_cache (
-            id INTEGER PRIMARY KEY,
-            query_text TEXT NOT NULL,
-            query_norm TEXT NOT NULL,
-            reg_no TEXT NOT NULL,
-            mark_text TEXT,
-            mark_text_norm TEXT,
-            owner_name TEXT,
-            country TEXT NOT NULL DEFAULT 'United Kingdom',
-            status TEXT,
-            category TEXT,
-            mark_type TEXT,
-            filed TEXT,
-            published TEXT,
-            registered TEXT,
-            expired TEXT,
-            renewal_due TEXT,
-            class_codes TEXT,
-            goods_services TEXT,
-            source_url TEXT,
-            fetched_at TEXT NOT NULL,
-            UNIQUE(query_norm, reg_no)
+    global _runtime_schema_mtime
+
+    db_mtime = DB_PATH.stat().st_mtime if DB_PATH.exists() else None
+    if _runtime_schema_mtime == db_mtime:
+        return
+
+    with _runtime_schema_lock:
+        db_mtime = DB_PATH.stat().st_mtime if DB_PATH.exists() else None
+        if _runtime_schema_mtime == db_mtime:
+            return
+
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fallback_cache (
+                id INTEGER PRIMARY KEY,
+                query_text TEXT NOT NULL,
+                query_norm TEXT NOT NULL,
+                reg_no TEXT NOT NULL,
+                mark_text TEXT,
+                mark_text_norm TEXT,
+                owner_name TEXT,
+                country TEXT NOT NULL DEFAULT 'United Kingdom',
+                status TEXT,
+                category TEXT,
+                mark_type TEXT,
+                filed TEXT,
+                published TEXT,
+                registered TEXT,
+                expired TEXT,
+                renewal_due TEXT,
+                class_codes TEXT,
+                goods_services TEXT,
+                source_url TEXT,
+                fetched_at TEXT NOT NULL,
+                UNIQUE(query_norm, reg_no)
+            )
+            """
         )
-        """
-    )
-    con.execute("CREATE INDEX IF NOT EXISTS idx_fallback_query_norm ON fallback_cache(query_norm)")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_fallback_reg_no ON fallback_cache(reg_no)")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_marks_mark_norm ON marks(mark_text_norm)")
-    con.execute(
-        "CREATE INDEX IF NOT EXISTS idx_marks_country_mark_text_norm ON marks(country, mark_text_norm)"
-    )
-    con.commit()
+        con.execute("CREATE INDEX IF NOT EXISTS idx_fallback_query_norm ON fallback_cache(query_norm)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_fallback_reg_no ON fallback_cache(reg_no)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_marks_mark_norm ON marks(mark_text_norm)")
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_marks_country_mark_text_norm ON marks(country, mark_text_norm)"
+        )
+        con.commit()
+        _runtime_schema_mtime = db_mtime
 
 
 def normalize_supplemental_record(item: dict[str, Any]) -> dict[str, Any] | None:
@@ -621,6 +635,7 @@ def query_candidates(
     term_norm: str,
     country: str,
     limit: int = 25,
+    skip_exact_search: bool = False,
 ) -> tuple[list[sqlite3.Row], dict[str, float]]:
     countries = expanded_countries_for_query(country)
     placeholders = ",".join(["?"] * len(countries))
@@ -673,26 +688,27 @@ def query_candidates(
         return False
 
     # 1) Exact normalized match (fast, index-friendly)
-    for variant in variants:
-        start = perf_counter()
-        rows = con.execute(
-            """
-            SELECT m.*
-            FROM marks m
-            WHERE m.country IN (""" + placeholders + """)
-              AND m.mark_text_norm = ?
-            LIMIT ?
-            """,
-            (*countries, variant, min(limit, max_candidates)),
-        ).fetchall()
-        elapsed_ms = (perf_counter() - start) * 1000
-        if variant == term_norm:
-            timings["exact_sql_ms"] += elapsed_ms
-        else:
-            timings["punctuation_exact_ms"] += elapsed_ms
-        add_rows(rows)
-        if candidates:
-            return rank_rows(candidates), timings
+    if not skip_exact_search:
+        for variant in variants:
+            start = perf_counter()
+            rows = con.execute(
+                """
+                SELECT m.*
+                FROM marks m
+                WHERE m.country IN (""" + placeholders + """)
+                  AND m.mark_text_norm = ?
+                LIMIT ?
+                """,
+                (*countries, variant, min(limit, max_candidates)),
+            ).fetchall()
+            elapsed_ms = (perf_counter() - start) * 1000
+            if variant == term_norm:
+                timings["exact_sql_ms"] += elapsed_ms
+            else:
+                timings["punctuation_exact_ms"] += elapsed_ms
+            add_rows(rows)
+            if candidates:
+                return rank_rows(candidates), timings
 
     # 2) Prefix match only (fast, index-friendly)
     for variant in variants:
@@ -1333,7 +1349,7 @@ def check():
     elif supplemental_matches:
         result_source = "supplemental_source"
     else:
-        rows, query_timings = query_candidates(con, term, term_norm, country)
+        rows, query_timings = query_candidates(con, term, term_norm, country, skip_exact_search=True)
         for key, value in query_timings.items():
             stage_timings[key] += value
 
