@@ -30,6 +30,7 @@ UKIPO_FALLBACK_CACHE_DAYS = int(os.getenv("UKIPO_FALLBACK_CACHE_DAYS", "14"))
 MAX_SQL_CANDIDATES = max(20, int(os.getenv("MAX_SQL_CANDIDATES", "40")))
 MAX_PYTHON_SCORE_ROWS = max(5, int(os.getenv("MAX_PYTHON_SCORE_ROWS", "15")))
 HIGH_SIMILARITY_CUTOFF = float(os.getenv("HIGH_SIMILARITY_CUTOFF", "0.9"))
+MAX_RETURNED_MATCHES = max(10, int(os.getenv("MAX_RETURNED_MATCHES", "15")))
 _download_lock = threading.Lock()
 _download_attempted = False
 _supplemental_marks_cache: list[dict[str, Any]] | None = None
@@ -294,6 +295,20 @@ def build_broad_fts_terms(norm: str) -> list[str]:
     return unique_parts[:1]
 
 
+def build_candidate_prefix_terms(norm: str) -> list[str]:
+    terms: list[str] = []
+    for token in significant_tokens(norm):
+        candidates = [token]
+        if len(token) >= 5:
+            candidates.append(token[:4])
+        for candidate in candidates:
+            if len(candidate) < 4:
+                continue
+            if candidate not in terms:
+                terms.append(candidate)
+    return terms[:4]
+
+
 def allow_broad_local_similarity(term_norm: str) -> bool:
     """Keep broad local similarity search on a short leash.
 
@@ -430,6 +445,46 @@ def ensure_runtime_schema(con: sqlite3.Connection) -> None:
     con.commit()
 
 
+def normalize_supplemental_record(item: dict[str, Any]) -> dict[str, Any] | None:
+    mark_text = (item.get("mark_text") or "").strip()
+    reg_no = (item.get("reg_no") or "").strip()
+    if not mark_text or not reg_no:
+        return None
+
+    owner_name = (item.get("owner_name") or "").strip()
+    class_codes = item.get("class_codes") or []
+    if isinstance(class_codes, str):
+        class_codes = [c.strip() for c in class_codes.split(",") if c.strip()]
+    elif isinstance(class_codes, list):
+        class_codes = [str(c).strip() for c in class_codes if str(c).strip()]
+    else:
+        class_codes = []
+
+    country = (item.get("country") or "United Kingdom").strip() or "United Kingdom"
+    source_url = (item.get("source_url") or "").strip()
+    if not source_url and reg_no:
+        source_url = f"https://trademarks.ipo.gov.uk/ipo-tmcase/page/Results/1/{reg_no}"
+
+    return {
+        "reg_no": reg_no,
+        "mark_text": mark_text,
+        "mark_text_norm": norm_text(mark_text),
+        "owner_name": owner_name,
+        "owner_type": (item.get("owner_type") or infer_owner_type(owner_name)).strip(),
+        "country": country,
+        "status": (item.get("status") or "").strip(),
+        "category": (item.get("category") or "").strip(),
+        "mark_type": (item.get("mark_type") or "Word").strip() or "Word",
+        "filed": (item.get("filed") or "").strip(),
+        "registered": (item.get("registered") or "").strip(),
+        "expired": (item.get("expired") or "").strip(),
+        "renewal_due": (item.get("renewal_due") or "").strip(),
+        "class_codes": class_codes,
+        "goods_services": (item.get("goods_services") or "").strip(),
+        "source_url": source_url,
+    }
+
+
 def load_supplemental_marks() -> list[dict[str, Any]]:
     global _supplemental_marks_cache, _supplemental_marks_mtime
 
@@ -454,11 +509,10 @@ def load_supplemental_marks() -> list[dict[str, Any]]:
     for item in records:
         if not isinstance(item, dict):
             continue
-        mark_text = (item.get("mark_text") or "").strip()
-        reg_no = (item.get("reg_no") or "").strip()
-        if not mark_text or not reg_no:
+        normalized = normalize_supplemental_record(item)
+        if not normalized:
             continue
-        cleaned.append(item)
+        cleaned.append(normalized)
 
     _supplemental_marks_cache = cleaned
     _supplemental_marks_mtime = mtime
@@ -517,7 +571,7 @@ def query_exact_candidates(
               AND m.mark_text_norm = ?
             LIMIT ?
             """,
-            (*countries, variant, min(limit, 10)),
+            (*countries, variant, min(limit, 20)),
         ).fetchall()
         elapsed_ms = (perf_counter() - start) * 1000
         if variant == term_norm:
@@ -532,6 +586,33 @@ def query_exact_candidates(
             candidates.append(row)
 
     return candidates[:limit], timings
+
+
+def query_related_prefix_candidates(
+    con: sqlite3.Connection,
+    term_norm: str,
+    country: str,
+    limit: int = 15,
+) -> tuple[list[sqlite3.Row], float]:
+    countries = expanded_countries_for_query(country)
+    placeholders = ",".join(["?"] * len(countries))
+    if len(term_norm) < 4:
+        return [], 0.0
+
+    upper = prefix_upper_bound(term_norm)
+    start = perf_counter()
+    rows = con.execute(
+        """
+        SELECT m.*
+        FROM marks m
+        WHERE m.country IN (""" + placeholders + """)
+          AND m.mark_text_norm >= ?
+          AND m.mark_text_norm < ?
+        LIMIT ?
+        """,
+        (*countries, term_norm, upper, min(limit, 20)),
+    ).fetchall()
+    return rows, (perf_counter() - start) * 1000
 
 
 def query_candidates(
@@ -555,6 +636,10 @@ def query_candidates(
         "fts_ms": 0.0,
         "python_scoring_ms": 0.0,
     }
+    token_prefix_terms = build_candidate_prefix_terms(term_norm)
+    whole_prefix_limit = 12 if punctuation_fast_path else 20
+    token_prefix_limit = 10 if punctuation_fast_path else 15
+    fts_limit = 8 if punctuation_fast_path else 10
 
     def add_rows(rows: list[sqlite3.Row]) -> None:
         for row in rows:
@@ -624,7 +709,7 @@ def query_candidates(
               AND m.mark_text_norm < ?
             LIMIT ?
             """,
-            (*countries, variant, upper, min(max_candidates, 12)),
+            (*countries, variant, upper, min(max_candidates, whole_prefix_limit)),
         ).fetchall()
         timings["punctuation_prefix_ms"] += (perf_counter() - start) * 1000
         add_rows(rows)
@@ -637,15 +722,35 @@ def query_candidates(
     if punctuation_fast_path:
         return [], timings
 
-    # 3) Bounded token-prefix FTS search.
+    # 3) Token-prefix range search for typo tolerance.
+    for token_prefix in token_prefix_terms:
+        upper = prefix_upper_bound(token_prefix)
+        start = perf_counter()
+        rows = con.execute(
+            """
+            SELECT m.*
+            FROM marks m
+            WHERE m.country IN (""" + placeholders + """)
+              AND m.mark_text_norm >= ?
+              AND m.mark_text_norm < ?
+            LIMIT ?
+            """,
+            (*countries, token_prefix, upper, min(max_candidates, token_prefix_limit)),
+        ).fetchall()
+        timings["punctuation_prefix_ms"] += (perf_counter() - start) * 1000
+        add_rows(rows)
+        if has_high_similarity(candidates) or len(candidates) >= max_candidates:
+            return rank_rows(candidates), timings
+
+    # 4) Bounded token-prefix FTS search.
     if ENABLE_LOCAL_SIMILARITY:
-        fts_tokens = significant_tokens(variants[0] if variants else term_norm)
+        fts_tokens = build_candidate_prefix_terms(variants[0] if variants else term_norm)
         if not fts_tokens:
             raw_tokens = tokenize(variants[0] if variants else term_norm)
             if len(raw_tokens) == 1 and len(raw_tokens[0]) >= 4:
-                fts_tokens = [raw_tokens[0]]
+                fts_tokens = [raw_tokens[0][:4]]
 
-        for token in fts_tokens[:1]:
+        for token in fts_tokens[:2]:
             try:
                 start = perf_counter()
                 rows = con.execute(
@@ -657,7 +762,7 @@ def query_candidates(
                       AND f.mark_text MATCH ?
                     LIMIT ?
                     """,
-                    (*countries, f"{token}*", min(max_candidates, 10)),
+                    (*countries, f"{token}*", min(max_candidates, fts_limit)),
                 ).fetchall()
                 timings["fts_ms"] += (perf_counter() - start) * 1000
             except sqlite3.OperationalError:
@@ -674,7 +779,7 @@ def query_candidates(
 
 def summarize_supplemental_mark(item: dict[str, Any], term_norm: str) -> dict[str, Any]:
     mark_text = (item.get("mark_text") or "").strip()
-    mark_norm = norm_text(mark_text)
+    mark_norm = item.get("mark_text_norm") or norm_text(mark_text)
     expired = item.get("expired", "") or ""
     filed = item.get("filed", "") or ""
     class_codes = item.get("class_codes") or []
@@ -737,7 +842,7 @@ def query_supplemental_candidates(
         if item_country not in countries:
             continue
 
-        mark_norm = norm_text(item.get("mark_text", ""))
+        mark_norm = item.get("mark_text_norm") or norm_text(item.get("mark_text", ""))
         if not mark_norm:
             continue
 
@@ -1209,6 +1314,22 @@ def check():
 
     if exact_rows:
         rows = exact_rows
+        if not needs_runtime_normalized_search(term) and len(exact_rows) < MAX_RETURNED_MATCHES:
+            related_rows, related_ms = query_related_prefix_candidates(
+                con,
+                term_norm,
+                country,
+                limit=MAX_RETURNED_MATCHES,
+            )
+            stage_timings["punctuation_prefix_ms"] += related_ms
+            seen_ids = {row["id"] for row in rows}
+            for row in related_rows:
+                if row["id"] in seen_ids:
+                    continue
+                rows.append(row)
+                seen_ids.add(row["id"])
+                if len(rows) >= MAX_RETURNED_MATCHES:
+                    break
     elif supplemental_matches:
         result_source = "supplemental_source"
     else:
@@ -1276,9 +1397,14 @@ def check():
     reference_classes = determine_reference_classes(matches, class_filter, term_norm)
     matches = prioritize_exact_matches(matches, term_norm, reference_classes)
     if has_exact_result(matches, term_norm):
-        matches = matches[:50]
+        matches = matches[:MAX_RETURNED_MATCHES]
     else:
-        matches = shortlist_relevant_matches(matches, term_norm, reference_classes, max_results=10)
+        matches = shortlist_relevant_matches(
+            matches,
+            term_norm,
+            reference_classes,
+            max_results=MAX_RETURNED_MATCHES,
+        )
     chosen_class_matches, cross_class_matches = split_mark_groups(matches, reference_classes)
     chosen_class_matches = prioritize_exact_matches(chosen_class_matches, term_norm, reference_classes)
     cross_class_matches = prioritize_exact_matches(cross_class_matches, term_norm, reference_classes)
