@@ -64,11 +64,18 @@ function init() {
   const summary = document.getElementById('summary');
   const notes = document.getElementById('notes');
   const matchesList = document.getElementById('matches-list');
+  const showMoreBtn = document.getElementById('show-more-btn');
   const warningBox = document.getElementById('warning-box');
   const warningText = document.getElementById('warning-text');
   const manualSearchWrap = document.getElementById('manual-search-wrap');
   const manualSearchLink = document.getElementById('manual-search-link');
   const sourceLabel = document.getElementById('source-label');
+  const INITIAL_MATCHES_LIMIT = 15;
+  const LOAD_MORE_MATCHES_LIMIT = 10;
+  let allSimilarMarks = [];
+  let currentSearchPayload = null;
+  let nextOffset = 0;
+  let hasMoreResults = false;
 
   function setBadge(level) {
     riskBadge.textContent = level.toUpperCase();
@@ -140,32 +147,20 @@ function init() {
     return el;
   }
 
-  async function submitForm() {
-    console.log('Submitting request');
-
-    if (checkBtn) {
-      checkBtn.disabled = true;
-      checkBtn.textContent = 'Checking...';
+  function renderMatches(matchBatch, reset = true) {
+    if (reset) {
+      matchesList.innerHTML = '';
     }
+    matchBatch.forEach((m) => {
+      matchesList.appendChild(renderMatch(m));
+    });
 
-    const trademarkEl = document.getElementById('trademark');
-    const countryEl = document.getElementById('country');
-    const classesEl = document.getElementById('classes');
-
-    const trademark = trademarkEl ? trademarkEl.value.trim() : '';
-    const country = countryEl ? countryEl.value : '';
-    const classes = classesEl ? classesEl.value.trim() : '';
-    const include_patents = false;
-
-    if (!trademark) {
-      alert('Please enter a trademark');
-      if (checkBtn) {
-        checkBtn.disabled = false;
-        checkBtn.textContent = 'Check Risk';
-      }
-      return;
+    if (showMoreBtn) {
+      showMoreBtn.hidden = !hasMoreResults;
     }
+  }
 
+  async function fetchCheck(payload) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 15000);
 
@@ -174,17 +169,11 @@ function init() {
       res = await fetch('/check', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ trademark, country, classes, include_patents }),
+        body: JSON.stringify(payload),
         signal: controller.signal
       });
     } catch (err) {
-      console.error('Fetch failed', err);
-      alert(`Request failed: ${err && err.message ? err.message : 'unknown error'}`);
-      if (checkBtn) {
-        checkBtn.disabled = false;
-        checkBtn.textContent = 'Check Risk';
-      }
-      return;
+      throw new Error(`Request failed: ${err && err.message ? err.message : 'unknown error'}`);
     } finally {
       clearTimeout(timeoutId);
     }
@@ -193,24 +182,17 @@ function init() {
     try {
       data = await res.json();
     } catch (err) {
-      alert('Server returned invalid JSON');
-      if (checkBtn) {
-        checkBtn.disabled = false;
-        checkBtn.textContent = 'Check Risk';
-      }
-      return;
+      throw new Error('Server returned invalid JSON');
     }
     if (!res.ok) {
-      alert(data.error || 'Request failed');
-      if (checkBtn) {
-        checkBtn.disabled = false;
-        checkBtn.textContent = 'Check Risk';
-      }
-      return;
+      throw new Error(data.error || 'Request failed');
     }
+    return data;
+  }
 
+  function updateTopLevelResult(data) {
     setBadge(data.risk_level);
-    summary.textContent = `${data.match_count} similar marks found for "${titleCaseWord(data.trademark)}" in the UK`;
+    summary.textContent = `${data.total_similar_count || data.match_count} similar marks found for "${titleCaseWord(data.trademark)}" in the UK`;
     if (sourceLabel) {
       sourceLabel.textContent = prettySource(data.result_source);
     }
@@ -243,14 +225,65 @@ function init() {
       li.textContent = n;
       notes.appendChild(li);
     });
+  }
 
-    matchesList.innerHTML = '';
-    (data.similar_marks || []).forEach(m => {
-      matchesList.appendChild(renderMatch(m));
-    });
+  async function submitForm() {
+    console.log('Submitting request');
+
+    if (checkBtn) {
+      checkBtn.disabled = true;
+      checkBtn.textContent = 'Checking...';
+    }
+
+    const trademarkEl = document.getElementById('trademark');
+    const countryEl = document.getElementById('country');
+    const classesEl = document.getElementById('classes');
+
+    const trademark = trademarkEl ? trademarkEl.value.trim() : '';
+    const country = countryEl ? countryEl.value : '';
+    const classes = classesEl ? classesEl.value.trim() : '';
+    const include_patents = false;
+
+    if (!trademark) {
+      alert('Please enter a trademark');
+      if (checkBtn) {
+        checkBtn.disabled = false;
+        checkBtn.textContent = 'Check Risk';
+      }
+      return;
+    }
+
+    currentSearchPayload = {
+      trademark,
+      country,
+      classes,
+      include_patents,
+      limit: INITIAL_MATCHES_LIMIT,
+      offset: 0
+    };
+
+    let data = {};
+    try {
+      data = await fetchCheck(currentSearchPayload);
+    } catch (err) {
+      console.error('Fetch failed', err);
+      alert(err.message || 'Request failed');
+      if (checkBtn) {
+        checkBtn.disabled = false;
+        checkBtn.textContent = 'Check Risk';
+      }
+      return;
+    }
+
+    updateTopLevelResult(data);
+
+    allSimilarMarks = data.similar_marks || [];
+    nextOffset = data.next_offset || allSimilarMarks.length;
+    hasMoreResults = Boolean(data.has_more);
+    renderMatches(allSimilarMarks, true);
 
     result.hidden = false;
-    matches.hidden = false;
+    matches.hidden = allSimilarMarks.length === 0;
 
     if (checkBtn) {
       checkBtn.disabled = false;
@@ -267,6 +300,32 @@ function init() {
     checkBtn.addEventListener('click', (e) => {
       e.preventDefault();
       submitForm();
+    });
+  }
+
+  if (showMoreBtn) {
+    showMoreBtn.addEventListener('click', async () => {
+      if (!currentSearchPayload || !hasMoreResults) return;
+      showMoreBtn.disabled = true;
+      showMoreBtn.textContent = 'Loading...';
+      try {
+        const data = await fetchCheck({
+          ...currentSearchPayload,
+          limit: LOAD_MORE_MATCHES_LIMIT,
+          offset: nextOffset
+        });
+        const newMatches = data.similar_marks || [];
+        allSimilarMarks = allSimilarMarks.concat(newMatches);
+        nextOffset = data.next_offset || allSimilarMarks.length;
+        hasMoreResults = Boolean(data.has_more);
+        renderMatches(newMatches, false);
+      } catch (err) {
+        console.error('Load more failed', err);
+        alert(err.message || 'Request failed');
+      } finally {
+        showMoreBtn.disabled = false;
+        showMoreBtn.textContent = 'Load more matches';
+      }
     });
   }
 }

@@ -31,6 +31,8 @@ MAX_SQL_CANDIDATES = max(20, int(os.getenv("MAX_SQL_CANDIDATES", "40")))
 MAX_PYTHON_SCORE_ROWS = max(5, int(os.getenv("MAX_PYTHON_SCORE_ROWS", "15")))
 HIGH_SIMILARITY_CUTOFF = float(os.getenv("HIGH_SIMILARITY_CUTOFF", "0.9"))
 MAX_RETURNED_MATCHES = max(10, int(os.getenv("MAX_RETURNED_MATCHES", "15")))
+DEFAULT_SIMILAR_LIMIT = max(1, int(os.getenv("DEFAULT_SIMILAR_LIMIT", "15")))
+MAX_SIMILAR_LIMIT = max(DEFAULT_SIMILAR_LIMIT, int(os.getenv("MAX_SIMILAR_LIMIT", "25")))
 _download_lock = threading.Lock()
 _download_attempted = False
 _supplemental_marks_cache: list[dict[str, Any]] | None = None
@@ -152,6 +154,14 @@ def parse_classes(s: str) -> list[str]:
         return []
     parts = re.split(r"[^0-9]+", s)
     return [p for p in parts if p]
+
+
+def parse_pagination_value(value: Any, default: int, minimum: int = 0, maximum: int = 100) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
 
 
 def infer_owner_type(name: str) -> str:
@@ -1284,6 +1294,8 @@ def check():
     country = (payload.get("country") or "").strip()
     class_filter = parse_classes(payload.get("classes") or "")
     include_patents = bool(payload.get("include_patents", True))
+    similar_limit = parse_pagination_value(payload.get("limit"), DEFAULT_SIMILAR_LIMIT, minimum=1, maximum=MAX_SIMILAR_LIMIT)
+    similar_offset = parse_pagination_value(payload.get("offset"), 0, minimum=0, maximum=1000)
 
     if not term:
         return jsonify({"error": "Missing trademark"}), 400
@@ -1424,9 +1436,12 @@ def check():
     chosen_class_matches, cross_class_matches = split_mark_groups(matches, reference_classes)
     chosen_class_matches = prioritize_exact_matches(chosen_class_matches, term_norm, reference_classes)
     cross_class_matches = prioritize_exact_matches(cross_class_matches, term_norm, reference_classes)
-    matches = chosen_class_matches + cross_class_matches
+    all_matches = chosen_class_matches + cross_class_matches
+    total_similar_count = len(all_matches)
+    page_matches = all_matches[similar_offset:similar_offset + similar_limit]
+    page_chosen_class_matches, page_cross_class_matches = split_mark_groups(page_matches, reference_classes)
 
-    risk, risk_explanation = score_risk(matches, reference_classes, term_norm)
+    risk, risk_explanation = score_risk(all_matches, reference_classes, term_norm)
 
     patents = [summarize_patent(r, term_norm) for r in patent_rows]
     patents.sort(key=lambda p: (p["active"], p["similarity"]), reverse=True)
@@ -1434,7 +1449,7 @@ def check():
 
     ukipo_manual_search_url = "https://trademarks.ipo.gov.uk/ipo-tmtext?reset"
 
-    if not matches:
+    if not all_matches:
         result_source = "no_match"
         uk_only = resolve_countries(country) == ["United Kingdom"]
         if fallback_allowed(country) and fallback_error:
@@ -1467,15 +1482,19 @@ def check():
             "ukipo_manual_search_url": ukipo_manual_search_url,
             "ukipo_manual_search_term": term,
             "reference_classes": reference_classes,
-            "match_count": len(matches),
+            "match_count": total_similar_count,
+            "total_similar_count": total_similar_count,
+            "returned_count": len(page_matches),
+            "has_more": (similar_offset + len(page_matches)) < total_similar_count,
+            "next_offset": similar_offset + len(page_matches),
             "patent_count": len(patents),
             "notes": [
                 "Usage is inferred from status/expiry fields in the dataset; it is not verified market use.",
                 "Owner business type is not provided by the dataset; owner_type is inferred from the owner name.",
             ],
-            "similar_marks": matches,
-            "chosen_class_matches": chosen_class_matches,
-            "cross_class_matches": cross_class_matches,
+            "similar_marks": page_matches,
+            "chosen_class_matches": page_chosen_class_matches,
+            "cross_class_matches": page_cross_class_matches,
             "patents": patents,
         }
     )
