@@ -30,15 +30,35 @@ UKIPO_FALLBACK_CACHE_DAYS = int(os.getenv("UKIPO_FALLBACK_CACHE_DAYS", "14"))
 MAX_SQL_CANDIDATES = max(20, int(os.getenv("MAX_SQL_CANDIDATES", "40")))
 MAX_PYTHON_SCORE_ROWS = max(5, int(os.getenv("MAX_PYTHON_SCORE_ROWS", "15")))
 HIGH_SIMILARITY_CUTOFF = float(os.getenv("HIGH_SIMILARITY_CUTOFF", "0.9"))
-MAX_RETURNED_MATCHES = max(10, int(os.getenv("MAX_RETURNED_MATCHES", "15")))
-DEFAULT_SIMILAR_LIMIT = max(1, int(os.getenv("DEFAULT_SIMILAR_LIMIT", "15")))
+MAX_RETURNED_MATCHES = max(10, int(os.getenv("MAX_RETURNED_MATCHES", "25")))
+DEFAULT_SIMILAR_LIMIT = max(1, int(os.getenv("DEFAULT_SIMILAR_LIMIT", "25")))
 MAX_SIMILAR_LIMIT = max(DEFAULT_SIMILAR_LIMIT, int(os.getenv("MAX_SIMILAR_LIMIT", "25")))
+ENABLE_STARTUP_WARMUP = os.getenv("ENABLE_STARTUP_WARMUP", "1") == "1"
+MARK_LIGHT_SELECT = """
+    m.id,
+    m.reg_no,
+    m.mark_text,
+    m.mark_text_norm,
+    m.owner_name,
+    m.owner_type,
+    m.country,
+    m.status,
+    m.category,
+    m.mark_type,
+    m.filed,
+    m.registered,
+    m.expired,
+    m.renewal_due,
+    m.class_codes
+"""
 _download_lock = threading.Lock()
 _download_attempted = False
 _supplemental_marks_cache: list[dict[str, Any]] | None = None
 _supplemental_marks_mtime: float | None = None
 _runtime_schema_lock = threading.Lock()
 _runtime_schema_mtime: float | None = None
+_warmup_lock = threading.Lock()
+_warmup_started = False
 
 app = Flask(__name__)
 ukipo_fallback_service = UKIPOFallbackService(timeout_seconds=UKIPO_FALLBACK_TIMEOUT)
@@ -114,7 +134,8 @@ def needs_runtime_normalized_search(term: str) -> bool:
     raw = (term or "").strip()
     if not raw:
         return False
-    return raw != normalize_text(raw)
+    lowered = re.sub(r"\s+", " ", raw.lower()).strip()
+    return normalize_text(raw) != lowered
 
 
 def search_norm_variants(term: str, term_norm: str) -> list[str]:
@@ -228,6 +249,58 @@ def similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
+def damerau_levenshtein_distance(a: str, b: str, max_distance: int = 3) -> int:
+    if a == b:
+        return 0
+    if not a or not b:
+        return max(len(a), len(b))
+    if abs(len(a) - len(b)) > max_distance:
+        return max_distance + 1
+
+    prev_prev = None
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        curr = [i]
+        row_min = curr[0]
+        for j, cb in enumerate(b, start=1):
+            cost = 0 if ca == cb else 1
+            value = min(
+                prev[j] + 1,
+                curr[j - 1] + 1,
+                prev[j - 1] + cost,
+            )
+            if (
+                prev_prev is not None
+                and i > 1
+                and j > 1
+                and ca == b[j - 2]
+                and a[i - 2] == cb
+            ):
+                value = min(value, prev_prev[j - 2] + 1)
+            curr.append(value)
+            if value < row_min:
+                row_min = value
+        if row_min > max_distance:
+            return max_distance + 1
+        prev_prev, prev = prev, curr
+    return prev[-1]
+
+
+def typo_similarity(term_norm: str, mark_norm: str) -> float:
+    term_tokens = tokenize(term_norm)
+    mark_tokens = tokenize(mark_norm)
+    if len(term_tokens) != 1 or len(mark_tokens) != 1:
+        return 0.0
+    a = term_tokens[0]
+    b = mark_tokens[0]
+    if min(len(a), len(b)) < 5:
+        return 0.0
+    distance = damerau_levenshtein_distance(a, b, max_distance=3)
+    if distance > 3:
+        return 0.0
+    return max(0.0, 1.0 - (distance / max(len(a), len(b), 1)))
+
+
 def build_fts_query(norm: str) -> str:
     if not norm:
         return ""
@@ -309,7 +382,20 @@ def build_broad_fts_terms(norm: str) -> list[str]:
 
 def build_candidate_prefix_terms(norm: str) -> list[str]:
     terms: list[str] = []
-    for token in significant_tokens(norm):
+    filtered_tokens: list[str] = []
+    for token in tokenize(norm):
+        if token in COMMON_SEARCH_TOKENS:
+            continue
+        if len(token) < 4:
+            continue
+        if token not in filtered_tokens:
+            filtered_tokens.append(token)
+
+    if not filtered_tokens:
+        filtered_tokens = significant_tokens(norm)
+
+    ordered_tokens = filtered_tokens[:2]
+    for token in ordered_tokens:
         candidates = [token]
         if len(token) >= 5:
             candidates.append(token[:4])
@@ -340,6 +426,7 @@ def local_similarity_score(term_norm: str, mark_norm: str) -> float:
         return 1.0
 
     seq = similarity(term_norm, mark_norm)
+    typo_sim = typo_similarity(term_norm, mark_norm)
     term_tokens = set(tokenize(term_norm))
     mark_tokens = set(tokenize(mark_norm))
     overlap = len(term_tokens & mark_tokens) / max(len(term_tokens), 1)
@@ -351,7 +438,11 @@ def local_similarity_score(term_norm: str, mark_norm: str) -> float:
         prefix_bonus = 0.12
 
     contains_bonus = 0.08 if term_norm in mark_norm or mark_norm in term_norm else 0.0
-    return min(1.0, seq * 0.62 + overlap * 0.22 + prefix_bonus + contains_bonus)
+    typo_bonus = 0.0
+    if typo_sim >= 0.7:
+        typo_bonus = 0.18
+    base = max(seq, typo_sim * 0.98)
+    return min(1.0, base * 0.62 + overlap * 0.22 + prefix_bonus + contains_bonus + typo_bonus)
 
 
 def token_overlap_ratio(term_norm: str, mark_norm: str) -> float:
@@ -366,6 +457,8 @@ def is_close_phrase_match(term_norm: str, mark_norm: str, sim: float) -> bool:
     if not term_norm or not mark_norm or term_norm == mark_norm:
         return False
     overlap = token_overlap_ratio(term_norm, mark_norm)
+    if typo_similarity(term_norm, mark_norm) >= 0.82:
+        return True
     if term_norm.startswith(mark_norm) or mark_norm.startswith(term_norm):
         return True
     if term_norm in mark_norm or mark_norm in term_norm:
@@ -380,6 +473,43 @@ def open_db() -> sqlite3.Connection:
     con.execute("PRAGMA case_sensitive_like=ON")
     ensure_runtime_schema(con)
     return con
+
+
+def warm_search_paths() -> None:
+    ok, msg = ensure_index()
+    if not ok:
+        app.logger.warning("Startup warm-up skipped: %s", msg)
+        return
+
+    started = perf_counter()
+    try:
+        con = open_db()
+        country_available(con, "United Kingdom")
+        query_exact_candidates(con, "microsoft", normalize_text("microsoft"), "United Kingdom", limit=1)
+        query_related_prefix_candidates(con, "micro", "United Kingdom", limit=1)
+        query_candidates(
+            con,
+            "micrasoft",
+            normalize_text("micrasoft"),
+            "United Kingdom",
+            limit=1,
+            skip_exact_search=True,
+        )
+        con.close()
+        app.logger.info("Startup warm-up completed in %.1fms", (perf_counter() - started) * 1000)
+    except Exception as exc:
+        app.logger.warning("Startup warm-up failed: %s", exc)
+
+
+def start_background_warmup() -> None:
+    global _warmup_started
+    if not ENABLE_STARTUP_WARMUP:
+        return
+    with _warmup_lock:
+        if _warmup_started:
+            return
+        _warmup_started = True
+    threading.Thread(target=warm_search_paths, daemon=True).start()
 
 
 def has_index() -> bool:
@@ -588,10 +718,10 @@ def query_exact_candidates(
     for variant in variants:
         start = perf_counter()
         rows = con.execute(
-            """
-            SELECT m.*
+            f"""
+            SELECT {MARK_LIGHT_SELECT}
             FROM marks m
-            WHERE m.country IN (""" + placeholders + """)
+            WHERE m.country IN ({placeholders})
               AND m.mark_text_norm = ?
             LIMIT ?
             """,
@@ -626,10 +756,10 @@ def query_related_prefix_candidates(
     upper = prefix_upper_bound(term_norm)
     start = perf_counter()
     rows = con.execute(
-        """
-        SELECT m.*
+        f"""
+        SELECT {MARK_LIGHT_SELECT}
         FROM marks m
-        WHERE m.country IN (""" + placeholders + """)
+        WHERE m.country IN ({placeholders})
           AND m.mark_text_norm >= ?
           AND m.mark_text_norm < ?
         LIMIT ?
@@ -653,7 +783,8 @@ def query_candidates(
     punctuation_fast_path = needs_runtime_normalized_search(term)
     candidates: list[sqlite3.Row] = []
     seen_ids: set[int] = set()
-    max_candidates = min(max(limit, 1), MAX_SQL_CANDIDATES)
+    multi_word_query = len(tokenize(term_norm)) > 1
+    max_candidates = 60 if multi_word_query else min(max(limit, 1), MAX_SQL_CANDIDATES)
     timings = {
         "exact_sql_ms": 0.0,
         "punctuation_exact_ms": 0.0,
@@ -662,8 +793,11 @@ def query_candidates(
         "python_scoring_ms": 0.0,
     }
     token_prefix_terms = build_candidate_prefix_terms(term_norm)
+    shared_phrase_tokens = [t for t in tokenize(term_norm) if len(t) >= 4 and t not in COMMON_SEARCH_TOKENS][:2]
     whole_prefix_limit = 12 if punctuation_fast_path else 20
-    token_prefix_limit = 10 if punctuation_fast_path else 15
+    token_prefix_limit = 10 if punctuation_fast_path else (8 if len(shared_phrase_tokens) > 1 else 15)
+    phrase_prefix_limit = 25 if len(shared_phrase_tokens) > 1 else 8
+    phrase_prefix_offsets = (0, 25) if len(shared_phrase_tokens) > 1 else (0,)
     fts_limit = 8 if punctuation_fast_path else 10
 
     def add_rows(rows: list[sqlite3.Row]) -> None:
@@ -678,18 +812,20 @@ def query_candidates(
 
     def rank_rows(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
         start = perf_counter()
-        shortlist = rows[:MAX_PYTHON_SCORE_ROWS]
+        shortlist = rows[: min(len(rows), max(MAX_PYTHON_SCORE_ROWS, 30 if not multi_word_query else 60))]
         ranked = sorted(
             shortlist,
             key=lambda row: (
                 is_active(row["status"], row["expired"]),
+                len(tokenize(row["mark_text_norm"] or "")) > 1 if multi_word_query else False,
                 row["mark_text_norm"] == term_norm,
+                token_overlap_ratio(term_norm, row["mark_text_norm"] or ""),
                 local_similarity_score(term_norm, row["mark_text_norm"] or ""),
             ),
             reverse=True,
         )
         timings["python_scoring_ms"] += (perf_counter() - start) * 1000
-        return ranked[:limit]
+        return ranked[: (60 if multi_word_query else limit)]
 
     def has_high_similarity(rows: list[sqlite3.Row]) -> bool:
         for row in rows[:MAX_PYTHON_SCORE_ROWS]:
@@ -702,10 +838,10 @@ def query_candidates(
         for variant in variants:
             start = perf_counter()
             rows = con.execute(
-                """
-                SELECT m.*
+                f"""
+                SELECT {MARK_LIGHT_SELECT}
                 FROM marks m
-                WHERE m.country IN (""" + placeholders + """)
+                WHERE m.country IN ({placeholders})
                   AND m.mark_text_norm = ?
                 LIMIT ?
                 """,
@@ -727,10 +863,10 @@ def query_candidates(
         upper = prefix_upper_bound(variant)
         start = perf_counter()
         rows = con.execute(
-            """
-            SELECT m.*
+            f"""
+            SELECT {MARK_LIGHT_SELECT}
             FROM marks m
-            WHERE m.country IN (""" + placeholders + """)
+            WHERE m.country IN ({placeholders})
               AND m.mark_text_norm >= ?
               AND m.mark_text_norm < ?
             LIMIT ?
@@ -748,15 +884,38 @@ def query_candidates(
     if punctuation_fast_path:
         return [], timings
 
-    # 3) Token-prefix range search for typo tolerance.
+    # 3) For multi-word phrases, pull in a small set of phrase marks sharing key tokens.
+    if len(shared_phrase_tokens) > 1:
+        for token in shared_phrase_tokens:
+            upper = prefix_upper_bound(token)
+            for phrase_offset in phrase_prefix_offsets:
+                start = perf_counter()
+                rows = con.execute(
+                    f"""
+                    SELECT {MARK_LIGHT_SELECT}
+                    FROM marks m
+                    WHERE m.country IN ({placeholders})
+                      AND m.mark_text_norm >= ?
+                      AND m.mark_text_norm < ?
+                      AND instr(m.mark_text_norm, ' ') > 0
+                    LIMIT ? OFFSET ?
+                    """,
+                    (*countries, token, upper, min(max_candidates, phrase_prefix_limit), phrase_offset),
+                ).fetchall()
+                timings["punctuation_prefix_ms"] += (perf_counter() - start) * 1000
+                add_rows(rows)
+                if has_high_similarity(candidates) or len(candidates) >= max_candidates:
+                    return rank_rows(candidates), timings
+
+    # 4) Token-prefix range search for typo tolerance.
     for token_prefix in token_prefix_terms:
         upper = prefix_upper_bound(token_prefix)
         start = perf_counter()
         rows = con.execute(
-            """
-            SELECT m.*
+            f"""
+            SELECT {MARK_LIGHT_SELECT}
             FROM marks m
-            WHERE m.country IN (""" + placeholders + """)
+            WHERE m.country IN ({placeholders})
               AND m.mark_text_norm >= ?
               AND m.mark_text_norm < ?
             LIMIT ?
@@ -768,7 +927,7 @@ def query_candidates(
         if has_high_similarity(candidates) or len(candidates) >= max_candidates:
             return rank_rows(candidates), timings
 
-    # 4) Bounded token-prefix FTS search.
+    # 5) Bounded token-prefix FTS search.
     if ENABLE_LOCAL_SIMILARITY:
         fts_tokens = build_candidate_prefix_terms(variants[0] if variants else term_norm)
         if not fts_tokens:
@@ -780,11 +939,11 @@ def query_candidates(
             try:
                 start = perf_counter()
                 rows = con.execute(
-                    """
-                    SELECT m.*
+                    f"""
+                    SELECT {MARK_LIGHT_SELECT}
                     FROM marks_fts f
                     JOIN marks m ON m.id = f.rowid
-                    WHERE m.country IN (""" + placeholders + """)
+                    WHERE m.country IN ({placeholders})
                       AND f.mark_text MATCH ?
                     LIMIT ?
                     """,
@@ -1008,9 +1167,21 @@ def dedupe_mark_rows(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
     return unique
 
 
+def fetch_mark_details_by_ids(con: sqlite3.Connection, ids: list[int]) -> dict[int, sqlite3.Row]:
+    if not ids:
+        return {}
+    placeholders = ",".join(["?"] * len(ids))
+    rows = con.execute(
+        "SELECT * FROM marks WHERE id IN (" + placeholders + ")",
+        tuple(ids),
+    ).fetchall()
+    return {int(row["id"]): row for row in rows}
+
+
 def score_match_conflict(match: dict[str, Any], term_norm: str, reference_classes: list[str]) -> float:
     mark_norm = norm_text(match.get("mark_text", ""))
     sim = float(match.get("similarity", 0.0))
+    typo_sim = typo_similarity(term_norm, mark_norm)
     exact = mark_norm == term_norm
     close_phrase = is_close_phrase_match(term_norm, mark_norm, sim)
     same_class = bool(reference_classes and (set(match.get("class_codes", [])) & set(reference_classes)))
@@ -1019,10 +1190,12 @@ def score_match_conflict(match: dict[str, Any], term_norm: str, reference_classe
     score = 0.0
     if exact:
         score += 7.0
-    elif sim >= 0.96:
+    elif same_class and sim >= 0.97:
         score += 5.5
-    elif close_phrase:
+    elif same_class and close_phrase:
         score += 4.0
+    elif typo_sim >= 0.86:
+        score += 2.0
     elif sim >= 0.88:
         score += 2.5
     elif sim >= 0.8:
@@ -1051,39 +1224,48 @@ def score_risk(matches: list[dict[str, Any]], reference_classes: list[str], term
     active_same_class_strong = 0
     active_cross_class_strong = 0
     moderate_matches = 0
+    strongest_typo_like = 0
 
     for match in matches[:10]:
         mark_norm = norm_text(match.get("mark_text", ""))
         sim = float(match.get("similarity", 0.0))
+        typo_sim = typo_similarity(term_norm, mark_norm)
         exact = mark_norm == term_norm
         same_class = bool(reference_classes and (set(match.get("class_codes", [])) & set(reference_classes)))
         active = bool(match.get("active"))
         score = score_match_conflict(match, term_norm, reference_classes)
         scored.append((score, match, exact, same_class))
+        if typo_sim >= 0.82:
+            strongest_typo_like += 1
 
         if active and same_class and (exact or sim >= 0.94):
             active_same_class_strong += 1
-        elif active and sim >= 0.9:
+        elif active and not same_class and sim >= 0.94:
             active_cross_class_strong += 1
-        elif score >= 4.5:
+        elif score >= 5.0:
             moderate_matches += 1
 
     top_score, top_match, top_exact, top_same_class = max(scored, key=lambda item: item[0])
     total_score = sum(score for score, _, _, _ in scored)
     top_active = bool(top_match.get("active"))
+    top_typo_sim = typo_similarity(term_norm, norm_text(top_match.get("mark_text", "")))
 
     if top_exact and top_same_class and top_active:
         return "high", "Identical active mark found in the same class"
     if active_same_class_strong > 0:
         return "high", "Very similar active mark found in the same class"
-    if active_same_class_strong + moderate_matches >= 2 and total_score >= 14:
+    if active_same_class_strong + moderate_matches >= 2 and total_score >= 15:
         return "high", "Multiple similar active marks found"
 
-    if active_cross_class_strong > 0 and total_score >= 8:
+    if active_cross_class_strong > 0 and total_score >= 9:
         return "medium", "Active similar marks found in other classes"
-    if moderate_matches >= 2 or total_score >= 9:
+    if top_typo_sim >= 0.82 and not top_same_class:
+        return "low", "Only typo-like or broad similar marks found"
+    if strongest_typo_like > 0 and moderate_matches == 0 and total_score < 9:
+        return "low", "Only typo-like or broad similar marks found"
+    if moderate_matches >= 2 or total_score >= 10:
         return "medium", "Multiple similar active marks found"
-    if top_score >= 5.0 and top_active:
+    if top_score >= 5.5 and top_active and (top_same_class or top_typo_sim < 0.82):
         return "medium", "Strong similar mark found"
 
     return "low", "Only weak or inactive matches found"
@@ -1109,6 +1291,7 @@ def summarize_mark(row: sqlite3.Row, term_norm: str) -> dict[str, Any]:
     expired = row["expired"] or ""
 
     return {
+        "_id": int(row["id"]) if "id" in row.keys() and row["id"] is not None else None,
         "reg_no": row["reg_no"],
         "mark_text": mark_text,
         "owner_name": row["owner_name"],
@@ -1132,6 +1315,26 @@ def summarize_mark(row: sqlite3.Row, term_norm: str) -> dict[str, Any]:
     }
 
 
+def hydrate_visible_matches(con: sqlite3.Connection, matches: list[dict[str, Any]], term_norm: str) -> list[dict[str, Any]]:
+    ids = [int(match["_id"]) for match in matches if isinstance(match.get("_id"), int)]
+    if not ids:
+        return [{k: v for k, v in match.items() if not k.startswith("_")} for match in matches]
+
+    detailed_rows = fetch_mark_details_by_ids(con, ids)
+    hydrated: list[dict[str, Any]] = []
+    for match in matches:
+        row_id = match.get("_id")
+        detailed = detailed_rows.get(int(row_id)) if isinstance(row_id, int) else None
+        if detailed is not None:
+            merged = summarize_mark(detailed, term_norm)
+            merged["similarity"] = match.get("similarity", merged.get("similarity", 0.0))
+            merged["data_source"] = match.get("data_source", merged.get("data_source", "local_database"))
+            hydrated.append({k: v for k, v in merged.items() if not k.startswith("_")})
+        else:
+            hydrated.append({k: v for k, v in match.items() if not k.startswith("_")})
+    return hydrated
+
+
 def determine_reference_classes(matches: list[dict[str, Any]], class_filter: list[str], term_norm: str) -> list[str]:
     reference_classes = list(class_filter)
     if reference_classes:
@@ -1146,17 +1349,26 @@ def determine_reference_classes(matches: list[dict[str, Any]], class_filter: lis
 def rank_mark(match: dict[str, Any], term_norm: str, reference_classes: list[str]) -> tuple:
     mark_norm = norm_text(match.get("mark_text", ""))
     sim = float(match.get("similarity", 0.0))
+    typo_sim = typo_similarity(term_norm, mark_norm)
     exact = mark_norm == term_norm
     close_phrase = is_close_phrase_match(term_norm, mark_norm, sim)
     same_class = bool(reference_classes and (set(match.get("class_codes", [])) & set(reference_classes)))
     overlap = token_overlap_ratio(term_norm, mark_norm)
+    term_tokens = tokenize(term_norm)
+    mark_tokens = tokenize(mark_norm)
+    phrase_like = len(term_tokens) > 1 and len(mark_tokens) > 1
+    leading_token_phrase = phrase_like and mark_tokens[0] == term_tokens[0]
     return (
         1 if exact else 0,
+        1 if leading_token_phrase else 0,
+        1 if phrase_like else 0,
+        1 if typo_sim >= 0.82 else 0,
         1 if close_phrase else 0,
         1 if same_class else 0,
         1 if match.get("active") else 0,
-        sim,
         overlap,
+        sim,
+        typo_sim,
     )
 
 
@@ -1192,9 +1404,13 @@ def shortlist_relevant_matches(
         prefix = mark_norm.startswith(term_norm) or term_norm.startswith(mark_norm)
         shared_token = overlap > 0
         close_phrase = is_close_phrase_match(term_norm, mark_norm, sim)
+        term_tokens = tokenize(term_norm)
+        mark_tokens = tokenize(mark_norm)
+        leading_token_phrase = len(term_tokens) > 1 and len(mark_tokens) > 1 and mark_tokens[0] == term_tokens[0]
         weak_penalty = 1 if (sim < 0.45 and overlap == 0 and not prefix) else 0
         return (
             1 if same_class else 0,
+            1 if leading_token_phrase else 0,
             1 if shared_token else 0,
             1 if prefix else 0,
             1 if close_phrase else 0,
@@ -1206,6 +1422,8 @@ def shortlist_relevant_matches(
 
     reranked = sorted(ranked, key=relevance_key, reverse=True)
     shortlisted: list[dict[str, Any]] = []
+    term_tokens = tokenize(term_norm)
+    leading_token = term_tokens[0] if term_tokens else ""
 
     for match in reranked:
         mark_norm = norm_text(match.get("mark_text", ""))
@@ -1219,6 +1437,20 @@ def shortlist_relevant_matches(
             shortlisted.append(match)
         if len(shortlisted) >= target_results:
             break
+
+    if leading_token and len(term_tokens) > 1 and len(shortlisted) < target_results:
+        seen_marks = {match.get("reg_no") or match.get("mark_text") for match in shortlisted}
+        for match in reranked:
+            mark_norm = norm_text(match.get("mark_text", ""))
+            mark_tokens = tokenize(mark_norm)
+            key = match.get("reg_no") or match.get("mark_text")
+            if key in seen_marks:
+                continue
+            if len(mark_tokens) > 1 and mark_tokens[0] == leading_token:
+                shortlisted.append(match)
+                seen_marks.add(key)
+            if len(shortlisted) >= target_results:
+                break
 
     return shortlisted or reranked[:minimum_results]
 
@@ -1385,7 +1617,6 @@ def check():
                 fallback_error = f"UKIPO fallback request failed: {exc}"
 
     patent_rows = query_patents(con, term_norm) if include_patents else []
-    con.close()
 
     rows = dedupe_mark_rows(rows)
     matches = [summarize_mark(r, term_norm) for r in rows]
@@ -1439,11 +1670,13 @@ def check():
     all_matches = chosen_class_matches + cross_class_matches
     total_similar_count = len(all_matches)
     page_matches = all_matches[similar_offset:similar_offset + similar_limit]
+    page_matches = hydrate_visible_matches(con, page_matches, term_norm)
     page_chosen_class_matches, page_cross_class_matches = split_mark_groups(page_matches, reference_classes)
 
     risk, risk_explanation = score_risk(all_matches, reference_classes, term_norm)
 
     patents = [summarize_patent(r, term_norm) for r in patent_rows]
+    con.close()
     patents.sort(key=lambda p: (p["active"], p["similarity"]), reverse=True)
     patents = patents[:50]
 
@@ -1514,6 +1747,9 @@ def health():
             "message": msg,
         }
     )
+
+
+start_background_warmup()
 
 
 if __name__ == "__main__":

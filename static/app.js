@@ -70,7 +70,7 @@ function init() {
   const manualSearchWrap = document.getElementById('manual-search-wrap');
   const manualSearchLink = document.getElementById('manual-search-link');
   const sourceLabel = document.getElementById('source-label');
-  const INITIAL_MATCHES_LIMIT = 15;
+  const INITIAL_MATCHES_LIMIT = 25;
   const LOAD_MORE_MATCHES_LIMIT = 10;
   let allSimilarMarks = [];
   let currentSearchPayload = null;
