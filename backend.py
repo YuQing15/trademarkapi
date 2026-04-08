@@ -475,28 +475,26 @@ def open_db() -> sqlite3.Connection:
     return con
 
 
-def warm_search_paths() -> None:
+def run_lightweight_warmup() -> float:
     ok, msg = ensure_index()
     if not ok:
-        app.logger.warning("Startup warm-up skipped: %s", msg)
-        return
+        raise RuntimeError(msg)
 
     started = perf_counter()
+    con = open_db()
     try:
-        con = open_db()
         country_available(con, "United Kingdom")
         query_exact_candidates(con, "microsoft", normalize_text("microsoft"), "United Kingdom", limit=1)
         query_related_prefix_candidates(con, "micro", "United Kingdom", limit=1)
-        query_candidates(
-            con,
-            "micrasoft",
-            normalize_text("micrasoft"),
-            "United Kingdom",
-            limit=1,
-            skip_exact_search=True,
-        )
+    finally:
         con.close()
-        app.logger.info("Startup warm-up completed in %.1fms", (perf_counter() - started) * 1000)
+    return (perf_counter() - started) * 1000
+
+
+def warm_search_paths() -> None:
+    try:
+        elapsed_ms = run_lightweight_warmup()
+        app.logger.info("Startup warm-up completed in %.1fms", elapsed_ms)
     except Exception as exc:
         app.logger.warning("Startup warm-up failed: %s", exc)
 
@@ -1731,6 +1729,15 @@ def check():
             "patents": patents,
         }
     )
+
+
+@app.route("/warmup")
+def warmup():
+    try:
+        elapsed_ms = run_lightweight_warmup()
+        return jsonify({"ok": True, "warmed": True, "duration_ms": round(elapsed_ms, 1)})
+    except Exception as exc:
+        return jsonify({"ok": False, "warmed": False, "message": str(exc)}), 503
 
 
 @app.route("/health")

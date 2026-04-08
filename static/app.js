@@ -76,6 +76,8 @@ function init() {
   let currentSearchPayload = null;
   let nextOffset = 0;
   let hasMoreResults = false;
+  let warmupReady = false;
+  let warmupPromise = null;
 
   function setBadge(level) {
     riskBadge.textContent = level.toUpperCase();
@@ -160,6 +162,21 @@ function init() {
     }
   }
 
+  async function warmBackend() {
+    try {
+      const res = await fetch('/warmup', {
+        method: 'GET',
+        cache: 'no-store',
+        credentials: 'same-origin'
+      });
+      if (res.ok) {
+        warmupReady = true;
+      }
+    } catch (err) {
+      console.warn('Warm-up request failed', err);
+    }
+  }
+
   async function fetchCheck(payload) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 15000);
@@ -232,7 +249,7 @@ function init() {
 
     if (checkBtn) {
       checkBtn.disabled = true;
-      checkBtn.textContent = 'Checking...';
+      checkBtn.textContent = warmupReady ? 'Checking...' : 'Waking up...';
     }
 
     const trademarkEl = document.getElementById('trademark');
@@ -302,6 +319,8 @@ function init() {
       submitForm();
     });
   }
+
+  warmupPromise = warmBackend();
 
   if (showMoreBtn) {
     showMoreBtn.addEventListener('click', async () => {
