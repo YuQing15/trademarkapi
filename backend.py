@@ -33,7 +33,8 @@ HIGH_SIMILARITY_CUTOFF = float(os.getenv("HIGH_SIMILARITY_CUTOFF", "0.9"))
 MAX_RETURNED_MATCHES = max(10, int(os.getenv("MAX_RETURNED_MATCHES", "25")))
 DEFAULT_SIMILAR_LIMIT = max(1, int(os.getenv("DEFAULT_SIMILAR_LIMIT", "25")))
 MAX_SIMILAR_LIMIT = max(DEFAULT_SIMILAR_LIMIT, int(os.getenv("MAX_SIMILAR_LIMIT", "25")))
-ENABLE_STARTUP_WARMUP = os.getenv("ENABLE_STARTUP_WARMUP", "1") == "1"
+RUNNING_ON_RENDER = bool(os.getenv("RENDER")) or bool(os.getenv("RENDER_SERVICE_ID"))
+ENABLE_STARTUP_WARMUP = os.getenv("ENABLE_STARTUP_WARMUP", "0" if RUNNING_ON_RENDER else "1") == "1"
 MARK_LIGHT_SELECT = """
     m.id,
     m.reg_no,
@@ -475,28 +476,34 @@ def open_db() -> sqlite3.Connection:
     return con
 
 
-def run_lightweight_warmup() -> float:
-    ok, msg = ensure_index()
-    if not ok:
-        raise RuntimeError(msg)
+def run_lightweight_warmup(*, allow_index_download: bool = False) -> tuple[bool, float, str]:
+    if allow_index_download:
+        ok, msg = ensure_index()
+        if not ok:
+            return False, 0.0, msg
+    elif not has_index():
+        return False, 0.0, "Index file is not available locally for warm-up"
 
     started = perf_counter()
-    con = open_db()
     try:
-        country_available(con, "United Kingdom")
-        query_exact_candidates(con, "microsoft", normalize_text("microsoft"), "United Kingdom", limit=1)
-        query_related_prefix_candidates(con, "micro", "United Kingdom", limit=1)
-    finally:
-        con.close()
-    return (perf_counter() - started) * 1000
+        con = open_db()
+        try:
+            country_available(con, "United Kingdom")
+            query_exact_candidates(con, "microsoft", normalize_text("microsoft"), "United Kingdom", limit=1)
+            query_related_prefix_candidates(con, "micro", "United Kingdom", limit=1)
+        finally:
+            con.close()
+    except Exception as exc:
+        return False, 0.0, str(exc)
+    return True, (perf_counter() - started) * 1000, ""
 
 
 def warm_search_paths() -> None:
-    try:
-        elapsed_ms = run_lightweight_warmup()
+    warmed, elapsed_ms, message = run_lightweight_warmup(allow_index_download=False)
+    if warmed:
         app.logger.info("Startup warm-up completed in %.1fms", elapsed_ms)
-    except Exception as exc:
-        app.logger.warning("Startup warm-up failed: %s", exc)
+    else:
+        app.logger.info("Startup warm-up skipped: %s", message)
 
 
 def start_background_warmup() -> None:
@@ -1733,11 +1740,15 @@ def check():
 
 @app.route("/warmup")
 def warmup():
-    try:
-        elapsed_ms = run_lightweight_warmup()
-        return jsonify({"ok": True, "warmed": True, "duration_ms": round(elapsed_ms, 1)})
-    except Exception as exc:
-        return jsonify({"ok": False, "warmed": False, "message": str(exc)}), 503
+    warmed, elapsed_ms, message = run_lightweight_warmup(allow_index_download=False)
+    return jsonify(
+        {
+            "ok": True,
+            "warmed": warmed,
+            "duration_ms": round(elapsed_ms, 1),
+            "message": message,
+        }
+    )
 
 
 @app.route("/health")

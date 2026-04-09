@@ -50,6 +50,7 @@ function init() {
   const form = document.getElementById('check-form');
   const checkBtn = document.getElementById('check-button');
   const statusEl = document.getElementById('js-status');
+  const inlineError = document.getElementById('inline-error');
   if (!form) {
     console.error('check-form not found');
     return;
@@ -78,6 +79,7 @@ function init() {
   let hasMoreResults = false;
   let warmupReady = false;
   let warmupPromise = null;
+  let hasSuccessfulSearch = false;
 
   function setBadge(level) {
     riskBadge.textContent = level.toUpperCase();
@@ -147,6 +149,28 @@ function init() {
       </div>
     `;
     return el;
+  }
+
+  function setInlineError(message) {
+    if (!inlineError) return;
+    inlineError.textContent = message || '';
+    inlineError.hidden = !message;
+  }
+
+  function clearResultsForPendingSearch() {
+    allSimilarMarks = [];
+    nextOffset = 0;
+    hasMoreResults = false;
+    matchesList.innerHTML = '';
+    if (showMoreBtn) {
+      showMoreBtn.hidden = true;
+    }
+    if (result) {
+      result.hidden = true;
+    }
+    if (matches) {
+      matches.hidden = true;
+    }
   }
 
   function renderMatches(matchBatch, reset = true) {
@@ -246,6 +270,8 @@ function init() {
 
   async function submitForm() {
     console.log('Submitting request');
+    setInlineError('');
+    clearResultsForPendingSearch();
 
     if (checkBtn) {
       checkBtn.disabled = true;
@@ -262,7 +288,7 @@ function init() {
     const include_patents = false;
 
     if (!trademark) {
-      alert('Please enter a trademark');
+      setInlineError('Please enter a trademark.');
       if (checkBtn) {
         checkBtn.disabled = false;
         checkBtn.textContent = 'Check Risk';
@@ -284,7 +310,10 @@ function init() {
       data = await fetchCheck(currentSearchPayload);
     } catch (err) {
       console.error('Fetch failed', err);
-      alert(err.message || 'Request failed');
+      const message = hasSuccessfulSearch
+        ? 'The search could not be completed right now. Please try again.'
+        : 'The search service may be waking up. Please wait a moment and try again.';
+      setInlineError(message);
       if (checkBtn) {
         checkBtn.disabled = false;
         checkBtn.textContent = 'Check Risk';
@@ -292,6 +321,7 @@ function init() {
       return;
     }
 
+    hasSuccessfulSearch = true;
     updateTopLevelResult(data);
 
     allSimilarMarks = data.similar_marks || [];
@@ -340,7 +370,9 @@ function init() {
         renderMatches(newMatches, false);
       } catch (err) {
         console.error('Load more failed', err);
-        alert(err.message || 'Request failed');
+        setInlineError(hasSuccessfulSearch
+          ? 'The search could not be completed right now. Please try again.'
+          : 'The search service may be waking up. Please wait a moment and try again.');
       } finally {
         showMoreBtn.disabled = false;
         showMoreBtn.textContent = 'Load more matches';
