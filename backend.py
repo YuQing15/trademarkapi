@@ -45,6 +45,7 @@ DEFAULT_SIMILAR_LIMIT = max(1, int(os.getenv("DEFAULT_SIMILAR_LIMIT", "25")))
 MAX_SIMILAR_LIMIT = max(DEFAULT_SIMILAR_LIMIT, int(os.getenv("MAX_SIMILAR_LIMIT", "25")))
 RUNNING_ON_RENDER = bool(os.getenv("RENDER")) or bool(os.getenv("RENDER_SERVICE_ID"))
 ENABLE_STARTUP_WARMUP = os.getenv("ENABLE_STARTUP_WARMUP", "0" if RUNNING_ON_RENDER else "1") == "1"
+DEBUG_RANKING = os.getenv("DEBUG_RANKING", "0") == "1"
 MARK_LIGHT_SELECT = """
     m.id,
     m.reg_no,
@@ -697,6 +698,147 @@ def should_try_fts(term_norm: str, multi_word_query: bool, candidates: list[sqli
     return allow_broad_local_similarity(term_norm)
 
 
+def should_try_remote_fallback(term_norm: str) -> bool:
+    tokens = tokenize(term_norm)
+    if not tokens:
+        return False
+    if len(tokens) > 3:
+        return False
+    joined = "".join(tokens)
+    if len(joined) < 4 or len(joined) > 18:
+        return False
+    return True
+
+
+def token_root(token: str) -> str:
+    token = (token or "").strip()
+    for suffix in ("buddhism", "buddhist", "ists", "isms", "ment", "tion", "ing", "ism", "ist", "ers", "ies", "es", "ed", "s"):
+        if token.endswith(suffix) and len(token) - len(suffix) >= 4:
+            return token[: -len(suffix)]
+    return token
+
+
+def token_variant_match(term_token: str, mark_token: str) -> bool:
+    if term_token == mark_token:
+        return True
+    term_root = token_root(term_token)
+    mark_root = token_root(mark_token)
+    if term_root and term_root == mark_root and len(term_root) >= 4:
+        return True
+    if len(term_token) >= 5 and len(mark_token) >= 5 and term_token[:5] == mark_token[:5]:
+        return True
+    return False
+
+
+def generic_first_word_only(term_norm: str, mark_norm: str) -> bool:
+    term_tokens = tokenize(term_norm)
+    mark_tokens = tokenize(mark_norm)
+    if len(term_tokens) < 2 or not mark_tokens:
+        return False
+    if term_tokens[0] != mark_tokens[0]:
+        return False
+    return token_overlap_ratio(term_norm, mark_norm) < 0.5
+
+
+def query_specific_token_matches(term_norm: str, mark_norm: str) -> int:
+    term_tokens = tokenize(term_norm)
+    mark_tokens = tokenize(mark_norm)
+    if len(term_tokens) < 2 or not mark_tokens:
+        return 0
+    matched = 0
+    used_mark_indexes: set[int] = set()
+    for term_token in term_tokens[1:]:
+        for idx, mark_token in enumerate(mark_tokens):
+            if idx in used_mark_indexes:
+                continue
+            if token_variant_match(term_token, mark_token):
+                matched += 1
+                used_mark_indexes.add(idx)
+                break
+    return matched
+
+
+def build_later_token_prefix_terms(term_norm: str) -> list[str]:
+    tokens = tokenize(term_norm)
+    if len(tokens) < 2:
+        return []
+    terms: list[str] = []
+    for token in tokens[1:]:
+        candidates = [token]
+        root = token_root(token)
+        if root and root != token and len(root) >= 4:
+            candidates.append(root)
+        if len(token) >= 5:
+            candidates.append(token[:5])
+        for candidate in candidates:
+            candidate = candidate.strip()
+            if len(candidate) < 4:
+                continue
+            if candidate not in terms:
+                terms.append(candidate)
+    return terms[:4]
+
+
+def first_and_later_token_match(term_norm: str, mark_norm: str) -> bool:
+    term_tokens = tokenize(term_norm)
+    mark_tokens = tokenize(mark_norm)
+    if len(term_tokens) < 2 or not mark_tokens:
+        return False
+    if term_tokens[0] not in mark_tokens:
+        return False
+    return query_specific_token_matches(term_norm, mark_norm) > 0
+
+
+def phrase_family_match(term_norm: str, mark_norm: str) -> bool:
+    return any(mark_norm.startswith(prefix) for prefix in build_phrase_family_prefixes(term_norm))
+
+
+def build_phrase_family_prefixes(term_norm: str) -> list[str]:
+    tokens = tokenize(term_norm)
+    if len(tokens) < 2:
+        return []
+    first = tokens[0]
+    second = tokens[1]
+    second_root = token_root(second)
+    candidates = [
+        f"{first} {second}",
+        f"{first} {second_root}" if second_root and second_root != second else "",
+        f"{first} {second[:4]}" if len(second) >= 4 else "",
+        f"{first} {second[:3]}" if len(second) >= 3 else "",
+        f"{first} {second[:1]}",
+    ]
+    seen: set[str] = set()
+    prefixes: list[str] = []
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if len(candidate) < len(first) + 2:
+            continue
+        if candidate not in seen:
+            seen.add(candidate)
+            prefixes.append(candidate)
+    return prefixes
+
+
+def is_structurally_relevant_multiword(term_norm: str, mark_norm: str, sim: float) -> bool:
+    term_tokens = tokenize(term_norm)
+    mark_tokens = tokenize(mark_norm)
+    first_token_match = bool(term_tokens and mark_tokens and term_tokens[0] == mark_tokens[0])
+    if phrase_family_match(term_norm, mark_norm):
+        return True
+    specific_token_matches = query_specific_token_matches(term_norm, mark_norm)
+    if first_token_match and sim >= 0.5:
+        return True
+    if specific_token_matches > 0:
+        return True
+    if token_overlap_ratio(term_norm, mark_norm) >= 0.5:
+        return True
+    if is_close_phrase_match(term_norm, mark_norm, sim):
+        return True
+    if not generic_first_word_only(term_norm, mark_norm) and sim >= 0.72:
+        return True
+    return False
+
+
 def local_similarity_score(term_norm: str, mark_norm: str) -> float:
     if not term_norm or not mark_norm:
         return 0.0
@@ -1002,7 +1144,11 @@ def query_exact_candidates(
     variants = search_norm_variants(term, term_norm)
     candidates: list[sqlite3.Row] = []
     seen_ids: set[int] = set()
-    timings = {"exact_sql_ms": 0.0, "punctuation_exact_ms": 0.0}
+    timings = {
+        "exact_sql_ms": 0.0,
+        "punctuation_exact_ms": 0.0,
+        "exact_candidate_count": 0.0,
+    }
 
     for variant in variants:
         start = perf_counter()
@@ -1021,6 +1167,7 @@ def query_exact_candidates(
             timings["exact_sql_ms"] += elapsed_ms
         else:
             timings["punctuation_exact_ms"] += elapsed_ms
+        timings["exact_candidate_count"] += len(rows)
         for row in rows:
             row_id = row["id"]
             if row_id in seen_ids:
@@ -1080,10 +1227,17 @@ def query_candidates(
         "prefix_sql_ms": 0.0,
         "fts_ms": 0.0,
         "python_scoring_ms": 0.0,
+        "exact_candidate_count": 0.0,
+        "prefix_candidate_count": 0.0,
+        "fts_candidate_count": 0.0,
     }
     token_prefix_terms = build_candidate_prefix_terms(term_norm)
     shared_phrase_tokens = [t for t in tokenize(term_norm) if len(t) >= 4 and t not in COMMON_SEARCH_TOKENS][:2]
+    later_phrase_tokens = build_later_token_prefix_terms(term_norm)
+    phrase_family_prefixes = build_phrase_family_prefixes(term_norm)
     whole_prefix_limit = 12 if punctuation_fast_path else 20
+    first_token_backfill_limit = 40 if len(tokenize(term_norm)) > 1 else 0
+    phrase_family_limit = 30 if len(tokenize(term_norm)) > 1 else 0
     token_prefix_limit = 10 if punctuation_fast_path else (8 if len(shared_phrase_tokens) > 1 else 15)
     phrase_prefix_limit = 25 if len(shared_phrase_tokens) > 1 else 8
     phrase_prefix_offsets = (0, 25) if len(shared_phrase_tokens) > 1 else (0,)
@@ -1141,6 +1295,7 @@ def query_candidates(
                 timings["exact_sql_ms"] += elapsed_ms
             else:
                 timings["punctuation_exact_ms"] += elapsed_ms
+            timings["exact_candidate_count"] += len(rows)
             add_rows(rows)
             if candidates:
                 return rank_rows(candidates), timings
@@ -1163,6 +1318,7 @@ def query_candidates(
             (*countries, variant, upper, min(max_candidates, whole_prefix_limit)),
         ).fetchall()
         timings["prefix_sql_ms"] += (perf_counter() - start) * 1000
+        timings["prefix_candidate_count"] += len(rows)
         add_rows(rows)
         if candidates and has_high_similarity(candidates):
             return rank_rows(candidates), timings
@@ -1172,6 +1328,74 @@ def query_candidates(
 
     if punctuation_fast_path:
         return [], timings
+
+    # 3) For multi-word phrase searches, prefer candidates that contain the first
+    # token plus a later/query-specific token or variant.
+    term_tokens = tokenize(term_norm)
+    if len(term_tokens) > 1 and len(term_tokens[0]) >= 4:
+        first_token = term_tokens[0]
+        first_upper = prefix_upper_bound(first_token)
+
+        # 3a) Pull a richer bounded family of phrase prefixes, e.g.:
+        # "lucky buddhist" -> "lucky buddh...", "lucky bud...", "lucky b..."
+        for family_prefix in phrase_family_prefixes:
+            upper = prefix_upper_bound(family_prefix)
+            start = perf_counter()
+            rows = con.execute(
+                f"""
+                SELECT {MARK_LIGHT_SELECT}
+                FROM marks m
+                WHERE m.country IN ({placeholders})
+                  AND m.mark_text_norm >= ?
+                  AND m.mark_text_norm < ?
+                LIMIT ?
+                """,
+                (*countries, family_prefix, upper, min(max_candidates, phrase_family_limit)),
+            ).fetchall()
+            timings["prefix_sql_ms"] += (perf_counter() - start) * 1000
+            timings["prefix_candidate_count"] += len(rows)
+            add_rows(rows)
+            if has_high_similarity(candidates) or len(candidates) >= max_candidates:
+                return rank_rows(candidates), timings
+
+        for later_token in later_phrase_tokens:
+            start = perf_counter()
+            rows = con.execute(
+                f"""
+                SELECT {MARK_LIGHT_SELECT}
+                FROM marks m
+                WHERE m.country IN ({placeholders})
+                  AND m.mark_text_norm >= ?
+                  AND m.mark_text_norm < ?
+                  AND instr(m.mark_text_norm, ?) > 0
+                LIMIT ?
+                """,
+                (*countries, first_token, first_upper, later_token, min(max_candidates, 20)),
+            ).fetchall()
+            timings["prefix_sql_ms"] += (perf_counter() - start) * 1000
+            timings["prefix_candidate_count"] += len(rows)
+            add_rows(rows)
+            if has_high_similarity(candidates) or len(candidates) >= max_candidates:
+                return rank_rows(candidates), timings
+
+        # 3b) Bounded richer backfill for first-token phrase families, e.g. "lucky ..."
+        start = perf_counter()
+        rows = con.execute(
+            f"""
+            SELECT {MARK_LIGHT_SELECT}
+            FROM marks m
+            WHERE m.country IN ({placeholders})
+              AND m.mark_text_norm >= ?
+              AND m.mark_text_norm < ?
+            LIMIT ?
+            """,
+            (*countries, first_token, first_upper, min(max_candidates, first_token_backfill_limit)),
+        ).fetchall()
+        timings["prefix_sql_ms"] += (perf_counter() - start) * 1000
+        timings["prefix_candidate_count"] += len(rows)
+        add_rows(rows)
+        if has_high_similarity(candidates) or len(candidates) >= max_candidates:
+            return rank_rows(candidates), timings
 
     # 3) For multi-word phrases, pull in a small set of phrase marks sharing key tokens.
     if len(shared_phrase_tokens) > 1:
@@ -1192,6 +1416,7 @@ def query_candidates(
                     (*countries, token, upper, min(max_candidates, phrase_prefix_limit), phrase_offset),
                 ).fetchall()
                 timings["prefix_sql_ms"] += (perf_counter() - start) * 1000
+                timings["prefix_candidate_count"] += len(rows)
                 add_rows(rows)
                 if has_high_similarity(candidates) or len(candidates) >= max_candidates:
                     return rank_rows(candidates), timings
@@ -1212,6 +1437,7 @@ def query_candidates(
             (*countries, token_prefix, upper, min(max_candidates, token_prefix_limit)),
         ).fetchall()
         timings["prefix_sql_ms"] += (perf_counter() - start) * 1000
+        timings["prefix_candidate_count"] += len(rows)
         add_rows(rows)
         if has_high_similarity(candidates) or len(candidates) >= max_candidates:
             return rank_rows(candidates), timings
@@ -1247,6 +1473,7 @@ def query_candidates(
                 timings["fts_ms"] += (perf_counter() - start) * 1000
             except sqlite3.OperationalError:
                 rows = []
+            timings["fts_candidate_count"] += len(rows)
             add_rows(rows)
             if has_high_similarity(candidates) or len(candidates) >= max_candidates:
                 break
@@ -1283,7 +1510,7 @@ def summarize_supplemental_mark(item: dict[str, Any], term_norm: str) -> dict[st
         "age_years": years_since(filed) if filed else None,
         "active": is_active(item.get("status", ""), expired),
         "class_codes": class_codes,
-        "goods_services": item.get("goods_services", ""),
+        "goods_services": clean_goods_services_display(item.get("goods_services", "")),
         "source_url": item.get("source_url", ""),
         "data_source": "supplemental_source",
         "similarity": round(local_similarity_score(term_norm, mark_norm), 4),
@@ -1576,6 +1803,29 @@ def country_available(con: sqlite3.Connection, country: str) -> bool:
     return row is not None
 
 
+def clean_goods_services_display(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return text
+
+    # already clean ending
+    if text.endswith(".") or text.endswith(";"):
+        return text
+
+    # 🔥 prefer semicolon first (goods/services are usually ; separated)
+    last_semicolon = text.rfind(";")
+    if last_semicolon != -1:
+        return text[: last_semicolon + 1].rstrip() + " …"
+
+    # fallback to full stop
+    last_period = text.rfind(".")
+    if last_period != -1:
+        return text[: last_period + 1].rstrip() + " …"
+
+    # nothing safe to cut on
+    return text
+
+
 def summarize_mark(row: sqlite3.Row, term_norm: str) -> dict[str, Any]:
     mark_text = row["mark_text"] or ""
     mark_norm = norm_text(mark_text)
@@ -1603,7 +1853,7 @@ def summarize_mark(row: sqlite3.Row, term_norm: str) -> dict[str, Any]:
         "age_years": years_since(filed) if filed else None,
         "active": is_active(row["status"], expired),
         "class_codes": (row["class_codes"] or "").split(",") if row["class_codes"] else [],
-        "goods_services": row["goods_services"] if "goods_services" in row.keys() else "",
+        "goods_services": clean_goods_services_display(row["goods_services"]) if "goods_services" in row.keys() else "",
         "source_url": row["source_url"] if "source_url" in row.keys() else "",
         "data_source": row["data_source"] if "data_source" in row.keys() else "local_database",
         "similarity": round(sim, 4),
@@ -1649,18 +1899,24 @@ def rank_mark(match: dict[str, Any], term_norm: str, reference_classes: list[str
     close_phrase = is_close_phrase_match(term_norm, mark_norm, sim)
     same_class = bool(reference_classes and (set(match.get("class_codes", [])) & set(reference_classes)))
     overlap = token_overlap_ratio(term_norm, mark_norm)
+    weak_first_word_only = generic_first_word_only(term_norm, mark_norm)
+    specific_token_matches = query_specific_token_matches(term_norm, mark_norm)
     term_tokens = tokenize(term_norm)
     mark_tokens = tokenize(mark_norm)
-    phrase_like = len(term_tokens) > 1 and len(mark_tokens) > 1
-    leading_token_phrase = phrase_like and mark_tokens[0] == term_tokens[0]
+    first_token_match = bool(term_tokens and mark_tokens and term_tokens[0] == mark_tokens[0])
+    first_plus_later = first_and_later_token_match(term_norm, mark_norm)
+    family_match = phrase_family_match(term_norm, mark_norm)
     return (
         1 if exact else 0,
-        1 if leading_token_phrase else 0,
-        1 if phrase_like else 0,
-        1 if typo_sim >= 0.82 else 0,
-        1 if close_phrase else 0,
+        1 if first_plus_later else 0,
+        1 if family_match else 0,
+        1 if first_token_match else 0,
+        specific_token_matches,
         1 if same_class else 0,
         1 if match.get("active") else 0,
+        1 if close_phrase else 0,
+        1 if overlap >= 0.5 else 0,
+        0 if weak_first_word_only else 1,
         overlap,
         sim,
         typo_sim,
@@ -1689,7 +1945,8 @@ def shortlist_relevant_matches(
 ) -> list[dict[str, Any]]:
     ranked = prioritize_exact_matches(matches, term_norm, reference_classes)
     target_results = min(max_results, 10)
-    minimum_results = min(5, len(ranked))
+    multi_word_query = len(tokenize(term_norm)) > 1
+    minimum_results = min(3 if multi_word_query else 5, len(ranked))
 
     def relevance_key(match: dict[str, Any]) -> tuple:
         mark_norm = norm_text(match.get("mark_text", ""))
@@ -1699,17 +1956,26 @@ def shortlist_relevant_matches(
         prefix = mark_norm.startswith(term_norm) or term_norm.startswith(mark_norm)
         shared_token = overlap > 0
         close_phrase = is_close_phrase_match(term_norm, mark_norm, sim)
+        weak_first_word_only = generic_first_word_only(term_norm, mark_norm)
+        specific_token_matches = query_specific_token_matches(term_norm, mark_norm)
         term_tokens = tokenize(term_norm)
         mark_tokens = tokenize(mark_norm)
-        leading_token_phrase = len(term_tokens) > 1 and len(mark_tokens) > 1 and mark_tokens[0] == term_tokens[0]
+        first_token_match = bool(term_tokens and mark_tokens and term_tokens[0] == mark_tokens[0])
+        first_plus_later = first_and_later_token_match(term_norm, mark_norm)
+        family_match = phrase_family_match(term_norm, mark_norm)
         weak_penalty = 1 if (sim < 0.45 and overlap == 0 and not prefix) else 0
         return (
-            1 if same_class else 0,
-            1 if leading_token_phrase else 0,
-            1 if shared_token else 0,
+            1 if first_plus_later else 0,
+            1 if family_match else 0,
+            1 if first_token_match else 0,
+            specific_token_matches,
             1 if prefix else 0,
+            1 if same_class else 0,
+            1 if overlap >= 0.5 else 0,
+            0 if weak_first_word_only else 1,
             1 if close_phrase else 0,
             1 if match.get("active") else 0,
+            1 if shared_token else 0,
             sim,
             overlap,
             -weak_penalty,
@@ -1717,8 +1983,12 @@ def shortlist_relevant_matches(
 
     reranked = sorted(ranked, key=relevance_key, reverse=True)
     shortlisted: list[dict[str, Any]] = []
+    deferred_first_token_only: list[dict[str, Any]] = []
+    deferred_generic: list[dict[str, Any]] = []
     term_tokens = tokenize(term_norm)
     leading_token = term_tokens[0] if term_tokens else ""
+    multi_word_query = len(term_tokens) > 1
+    strong_multi_word_count = 0
 
     for match in reranked:
         mark_norm = norm_text(match.get("mark_text", ""))
@@ -1727,27 +1997,105 @@ def shortlist_relevant_matches(
         same_class = bool(reference_classes and (set(match.get("class_codes", [])) & set(reference_classes)))
         prefix = mark_norm.startswith(term_norm) or term_norm.startswith(mark_norm)
         shared_token = overlap > 0
-        keep = same_class or shared_token or prefix or sim >= 0.55
-        if keep or len(shortlisted) < minimum_results:
+        specific_token_matches = query_specific_token_matches(term_norm, mark_norm)
+        strong_multi_word = multi_word_query and is_structurally_relevant_multiword(term_norm, mark_norm, sim)
+        first_token_only = multi_word_query and generic_first_word_only(term_norm, mark_norm)
+        term_tokens_local = tokenize(term_norm)
+        mark_tokens_local = tokenize(mark_norm)
+        first_token_match = bool(term_tokens_local and mark_tokens_local and term_tokens_local[0] == mark_tokens_local[0])
+        first_plus_later = first_and_later_token_match(term_norm, mark_norm)
+        family_match = phrase_family_match(term_norm, mark_norm)
+        if strong_multi_word:
+            strong_multi_word_count += 1
+        keep = (
+            same_class
+            or strong_multi_word
+            or (multi_word_query and first_plus_later)
+            or (multi_word_query and family_match)
+            or (multi_word_query and first_token_match and sim >= 0.5)
+            or (not multi_word_query and (shared_token or prefix or sim >= 0.55))
+        )
+        if multi_word_query and first_token_only and not keep:
+            deferred_first_token_only.append(match)
+            continue
+        if multi_word_query and not keep:
+            deferred_generic.append(match)
+            continue
+        if keep or (len(shortlisted) < minimum_results and not first_token_only):
             shortlisted.append(match)
         if len(shortlisted) >= target_results:
             break
 
+    if len(shortlisted) < minimum_results and deferred_first_token_only:
+        for match in deferred_first_token_only:
+            shortlisted.append(match)
+            if len(shortlisted) >= minimum_results:
+                break
+
     if leading_token and len(term_tokens) > 1 and len(shortlisted) < target_results:
         seen_marks = {match.get("reg_no") or match.get("mark_text") for match in shortlisted}
-        for match in reranked:
+        if strong_multi_word_count >= minimum_results:
+            first_token_backfill_limit = max(1, min(3, target_results - len(shortlisted)))
+        elif strong_multi_word_count >= 2:
+            first_token_backfill_limit = max(2, min(3, target_results - len(shortlisted)))
+        else:
+            first_token_backfill_limit = min(5, target_results - len(shortlisted))
+        first_token_backfill_added = 0
+        for match in deferred_first_token_only + deferred_generic + reranked:
             mark_norm = norm_text(match.get("mark_text", ""))
             mark_tokens = tokenize(mark_norm)
             key = match.get("reg_no") or match.get("mark_text")
             if key in seen_marks:
                 continue
-            if len(mark_tokens) > 1 and mark_tokens[0] == leading_token:
+            if mark_tokens and mark_tokens[0] == leading_token:
                 shortlisted.append(match)
                 seen_marks.add(key)
+                first_token_backfill_added += 1
+            if first_token_backfill_added >= first_token_backfill_limit:
+                break
             if len(shortlisted) >= target_results:
                 break
 
-    return shortlisted or reranked[:minimum_results]
+    if len(shortlisted) < minimum_results:
+        seen_marks = {match.get("reg_no") or match.get("mark_text") for match in shortlisted}
+        for match in reranked:
+            key = match.get("reg_no") or match.get("mark_text")
+            if key in seen_marks:
+                continue
+            shortlisted.append(match)
+            seen_marks.add(key)
+            if len(shortlisted) >= minimum_results:
+                break
+
+    if shortlisted:
+        return sorted(shortlisted, key=relevance_key, reverse=True)
+    return reranked[:minimum_results]
+
+
+def log_ranking_debug(matches: list[dict[str, Any]], term_norm: str, reference_classes: list[str], label: str) -> None:
+    if not DEBUG_RANKING:
+        return
+    preview = prioritize_exact_matches(matches, term_norm, reference_classes)[:10]
+    app.logger.info("ranking debug term=%r label=%s top=%d", term_norm, label, len(preview))
+    for idx, match in enumerate(preview, start=1):
+        mark_norm = norm_text(match.get("mark_text", ""))
+        app.logger.info(
+            "ranking debug #%d reg_no=%s mark=%r sim=%.4f overlap=%.3f typo=%.3f specific_tokens=%d first_token_match=%s first_plus_later=%s family_match=%s same_class=%s active=%s generic_first_word_only=%s exact=%s",
+            idx,
+            match.get("reg_no"),
+            match.get("mark_text"),
+            float(match.get("similarity", 0.0)),
+            token_overlap_ratio(term_norm, mark_norm),
+            typo_similarity(term_norm, mark_norm),
+            query_specific_token_matches(term_norm, mark_norm),
+            bool(tokenize(term_norm) and tokenize(mark_norm) and tokenize(term_norm)[0] == tokenize(mark_norm)[0]),
+            first_and_later_token_match(term_norm, mark_norm),
+            phrase_family_match(term_norm, mark_norm),
+            bool(reference_classes and (set(match.get("class_codes", [])) & set(reference_classes))),
+            bool(match.get("active")),
+            generic_first_word_only(term_norm, mark_norm),
+            mark_norm == term_norm,
+        )
 
 
 def split_mark_groups(matches: list[dict[str, Any]], reference_classes: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1850,6 +2198,9 @@ def check():
         "supplemental_lookup_ms": 0.0,
         "fallback_search_ms": 0.0,
         "total_request_ms": 0.0,
+        "exact_candidate_count": 0.0,
+        "prefix_candidate_count": 0.0,
+        "fts_candidate_count": 0.0,
     }
 
     exact_rows, exact_timings = query_exact_candidates(con, term, term_norm, country)
@@ -1893,7 +2244,7 @@ def check():
         for key, value in query_timings.items():
             stage_timings[key] += value
 
-    if not rows and not supplemental_matches and fallback_allowed(country):
+    if not rows and not supplemental_matches and fallback_allowed(country) and should_try_remote_fallback(term_norm):
         cached_rows = query_fallback_cache(con, term_norm, limit=UKIPO_FALLBACK_LIMIT)
         if cached_rows:
             rows = cached_rows
@@ -1939,7 +2290,7 @@ def check():
 
     stage_timings["total_request_ms"] = (perf_counter() - request_started) * 1000
     app.logger.info(
-        "check timing trademark=%r punctuation_fast=%s exact_search=%.1fms punctuation_exact=%.1fms prefix_search=%.1fms fallback_search=%.1fms fts=%.1fms ranking=%.1fms supplemental=%.1fms total=%.1fms",
+        "check timing trademark=%r punctuation_fast=%s exact_search=%.1fms punctuation_exact=%.1fms prefix_search=%.1fms fallback_search=%.1fms fts=%.1fms ranking=%.1fms supplemental=%.1fms total=%.1fms candidates(exact=%.0f prefix=%.0f fts=%.0f final=%d)",
         term,
         needs_runtime_normalized_search(term),
         stage_timings["exact_sql_ms"],
@@ -1950,9 +2301,14 @@ def check():
         stage_timings["python_scoring_ms"],
         stage_timings["supplemental_lookup_ms"],
         stage_timings["total_request_ms"],
+        stage_timings["exact_candidate_count"],
+        stage_timings["prefix_candidate_count"],
+        stage_timings["fts_candidate_count"],
+        len(matches),
     )
 
     reference_classes = determine_reference_classes(matches, class_filter, term_norm)
+    log_ranking_debug(matches, term_norm, reference_classes, "pre-shortlist")
     matches = prioritize_exact_matches(matches, term_norm, reference_classes)
     if has_exact_result(matches, term_norm):
         matches = matches[:MAX_RETURNED_MATCHES]
@@ -1963,6 +2319,7 @@ def check():
             reference_classes,
             max_results=MAX_RETURNED_MATCHES,
         )
+    log_ranking_debug(matches, term_norm, reference_classes, "post-shortlist")
     chosen_class_matches, cross_class_matches = split_mark_groups(matches, reference_classes)
     chosen_class_matches = prioritize_exact_matches(chosen_class_matches, term_norm, reference_classes)
     cross_class_matches = prioritize_exact_matches(cross_class_matches, term_norm, reference_classes)
