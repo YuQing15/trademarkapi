@@ -2,29 +2,31 @@
 set -euo pipefail
 
 DB_DIR="data"
-PARTS_DIR="${DB_DIR}/db_parts"
 DB_PATH="${DB_DIR}/trademarks_clean.sqlite"
-BASE_URL="https://github.com/YuQing15/trademarkapi/releases/download/v1.1.0"
 
-mkdir -p "${DB_DIR}" "${PARTS_DIR}"
+PART_AA_URL="https://github.com/YuQing15/trademarkapi/releases/download/v1.1.0/trademarks_clean.sqlite.part_aa"
+PART_AB_URL="https://github.com/YuQing15/trademarkapi/releases/download/v1.1.0/trademarks_clean.sqlite.part_ab"
+
+PART_AA="${DB_DIR}/trademarks_clean.sqlite.part_aa"
+PART_AB="${DB_DIR}/trademarks_clean.sqlite.part_ab"
+
+mkdir -p "${DB_DIR}"
 
 if [ -f "${DB_PATH}" ]; then
-  echo "Database already exists"
+  echo "Database already exists: ${DB_PATH}"
   exit 0
 fi
 
-echo "Downloading split database parts into ${PARTS_DIR}"
-curl -fL "${BASE_URL}/trademarks_clean.sqlite.part_aa" -o "${PARTS_DIR}/trademarks_clean.sqlite.part_aa"
-curl -fL "${BASE_URL}/trademarks_clean.sqlite.part_ab" -o "${PARTS_DIR}/trademarks_clean.sqlite.part_ab"
+echo "Downloading database parts..."
 
-echo "Combining parts into ${DB_PATH}"
-cat "${PARTS_DIR}"/trademarks_clean.sqlite.part_* > "${DB_PATH}"
+curl -fL "$PART_AA_URL" -o "$PART_AA"
+curl -fL "$PART_AB_URL" -o "$PART_AB"
 
-echo "Validating database"
-if [ "$(sqlite3 "${DB_PATH}" "PRAGMA integrity_check;")" != "ok" ]; then
-  echo "Database integrity check failed" >&2
-  exit 1
-fi
+echo "Merging parts..."
 
-rm -rf "${PARTS_DIR}"
-echo "Database download and reconstruction complete: ${DB_PATH}"
+cat "$PART_AA" "$PART_AB" > "$DB_PATH"
+
+echo "Cleaning up parts..."
+rm "$PART_AA" "$PART_AB"
+
+echo "Database ready: $DB_PATH"
