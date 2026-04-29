@@ -8,18 +8,28 @@ import sqlite3
 import threading
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, date
 from pathlib import Path
 from time import perf_counter
 from typing import Any
 from difflib import SequenceMatcher
 
+from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_from_directory, render_template
 from flask_cors import CORS
 
 from services.ukipo_fallback import UKIPOFallbackService
 
-DB_PATH = Path(os.getenv("TRADEMARK_DB_PATH", "data/trademarks.sqlite"))
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
+
+UKIPO_DATA_PATH = os.getenv("UKIPO_DATA_PATH")
+DATA_PATH = UKIPO_DATA_PATH
+DATABASE_PATH = os.getenv("DATABASE_PATH", os.getenv("TRADEMARK_DB_PATH", "data/trademarks_clean.sqlite"))
+# TEMP DEBUG: remove these prints after path setup is confirmed.
+print("DATABASE_PATH:", DATABASE_PATH)
+print("UKIPO_DATA_PATH:", UKIPO_DATA_PATH)
+DB_PATH = Path(DATABASE_PATH)
 DB_URL = os.getenv("TRADEMARK_DB_URL", "").strip()
 SUPPLEMENTAL_MARKS_PATH = Path(os.getenv("SUPPLEMENTAL_MARKS_PATH", "data/supplemental_marks.json"))
 ENABLE_UKIPO_FALLBACK = os.getenv("ENABLE_UKIPO_FALLBACK", "0") == "1"
@@ -96,6 +106,265 @@ def normalize_text(text: str) -> str:
 
 def norm_text(s: str) -> str:
     return normalize_text(s)
+
+
+def scan_increment_files() -> None:
+    if not DATA_PATH:
+        print("UKIPO_DATA_PATH is not set")
+        return
+
+    increments_root = Path(DATA_PATH) / "increments"
+    if not increments_root.exists():
+        print(f"Increments folder not found: {increments_root}")
+        return
+
+    for year_dir in sorted(p for p in increments_root.iterdir() if p.is_dir()):
+        for month_dir in sorted(p for p in year_dir.iterdir() if p.is_dir()):
+            for day_dir in sorted(p for p in month_dir.iterdir() if p.is_dir()):
+                for file_path in sorted(p for p in day_dir.iterdir() if p.is_file()):
+                    if file_path.suffix.lower() != ".xml":
+                        continue
+                    print(file_path)
+
+
+def test_full_dataset_connection() -> None:
+    if not UKIPO_DATA_PATH:
+        print("UKIPO_DATA_PATH is not set")
+        return
+
+    latest_root = Path(UKIPO_DATA_PATH) / "full" / "rep_export_2026_03_13_13_32_48"
+    if not latest_root.exists():
+        print(f"Latest full dataset folder not found: {latest_root}")
+        return
+
+    def is_real_xml_file(path: Path) -> bool:
+        name = path.name
+        return (
+            path.suffix.lower() == ".xml"
+            and not name.startswith(".")
+            and not name.startswith("._")
+            and name != ".DS_Store"
+        )
+
+    candidate_names = sorted(
+        name for name in os.listdir(latest_root)
+        if name.lower().endswith(".xml") and not name.startswith(".") and not name.startswith("._")
+    )
+    print("First 10 candidate XML filenames:")
+    for name in candidate_names[:10]:
+        print(name)
+
+    if not candidate_names:
+        print(f"No XML files found in: {latest_root}")
+        return
+
+    xml_file = latest_root / candidate_names[0]
+    if not is_real_xml_file(xml_file) or not xml_file.is_file():
+        print(f"First candidate is not a real XML file: {xml_file}")
+        return
+
+    print(f"XML file: {xml_file}")
+    print("--- first lines ---")
+    with xml_file.open("r", encoding="utf-8", errors="ignore") as handle:
+        for _ in range(10):
+            line = handle.readline()
+            if not line:
+                break
+            print(line.rstrip("\n"))
+
+
+FULL_DATASET_TEST_SUBDIR = "rep_export_2026_03_13_13_32_48"
+
+
+def _full_dataset_test_root() -> Path | None:
+    if not UKIPO_DATA_PATH:
+        print("UKIPO_DATA_PATH is not set")
+        return None
+
+    full_root = Path(UKIPO_DATA_PATH) / "full" / FULL_DATASET_TEST_SUBDIR
+    if not full_root.exists():
+        print(f"Latest full dataset folder not found: {full_root}")
+        return None
+    return full_root
+
+
+def _full_dataset_candidate_xml_names(root: Path) -> list[str]:
+    return sorted(
+        name
+        for name in os.listdir(root)
+        if name.lower().endswith(".xml") and not name.startswith(".") and not name.startswith("._")
+    )
+
+
+def _full_dataset_find_text(node: ET.Element, xpath: str, ns: dict[str, str]) -> str:
+    found = node.find(xpath, ns)
+    return (found.text or "").strip() if found is not None and found.text else ""
+
+
+def parse_full_dataset_record(xml_file: Path) -> dict[str, Any] | None:
+    ns = {"tm": "http://www.ipo.gov.uk/schemas/tm"}
+    tree = ET.parse(xml_file)
+    root = tree.getroot()
+    trademark = root.find("tm:TradeMark", ns)
+    if trademark is None:
+        return None
+
+    applicant_names = [
+        (element.text or "").strip()
+        for element in trademark.findall(".//tm:ApplicantDetails/tm:Applicant/tm:Name", ns)
+        if element.text and element.text.strip()
+    ]
+    class_numbers = [
+        (element.text or "").strip()
+        for element in trademark.findall(".//tm:ClassDescription/tm:ClassNumber", ns)
+        if element.text and element.text.strip()
+    ]
+    goods_services = []
+    for class_description in trademark.findall(".//tm:ClassDescription", ns):
+        class_number = _full_dataset_find_text(class_description, "tm:ClassNumber", ns)
+        description = _full_dataset_find_text(class_description, "tm:GoodsServicesDescription", ns)
+        if not description:
+            continue
+        goods_services.append(f"Class {class_number}: {description}" if class_number else description)
+
+    application_datetime = _full_dataset_find_text(trademark, "tm:ApplicationDateTime", ns)
+    publication_date = _full_dataset_find_text(
+        trademark, "tm:PublicationDetails/tm:Publication/tm:PublicationDate", ns
+    )
+    registration_date = _full_dataset_find_text(
+        trademark, "tm:RegistrationDetails/tm:RegistrationDate", ns
+    )
+    mark_text = _full_dataset_find_text(
+        trademark, "tm:WordMarkSpecification/tm:MarkVerbalElementText", ns
+    )
+    owner_name = applicant_names[0] if applicant_names else ""
+    mark_feature = _full_dataset_find_text(trademark, "tm:MarkFeature", ns)
+
+    return {
+        "xml_file": str(xml_file),
+        "ApplicationNumber": _full_dataset_find_text(trademark, "tm:ApplicationNumber", ns),
+        "MarkVerbalElementText": mark_text,
+        "IPOPublicMarkCurrentStatusCode": _full_dataset_find_text(
+            trademark, "tm:IPOPublicMarkCurrentStatusCode", ns
+        ),
+        "ApplicantName": owner_name,
+        "ApplicantNames": applicant_names,
+        "ClassNumbers": class_numbers,
+        "GoodsServicesDescription": goods_services,
+        "ApplicationDateTime": application_datetime,
+        "PublicationDate": publication_date,
+        "RegistrationDate": registration_date,
+        "KindMark": _full_dataset_find_text(trademark, "tm:KindMark", ns),
+        "MarkFeature": mark_feature,
+    }
+
+
+def parse_full_dataset_sample() -> dict[str, Any] | None:
+    latest_root = _full_dataset_test_root()
+    if latest_root is None:
+        return None
+
+    candidate_names = _full_dataset_candidate_xml_names(latest_root)
+    if not candidate_names:
+        print(f"No XML files found in: {latest_root}")
+        return None
+
+    xml_file = latest_root / candidate_names[0]
+    record = parse_full_dataset_record(xml_file)
+    if record is None:
+        print(f"No TradeMark element found in: {xml_file}")
+        return None
+
+    print(json.dumps(record, indent=2, ensure_ascii=False))
+    return record
+
+
+def import_full_dataset_test_records(limit: int = 5) -> list[dict[str, Any]]:
+    latest_root = _full_dataset_test_root()
+    if latest_root is None:
+        return []
+
+    candidate_names = _full_dataset_candidate_xml_names(latest_root)
+    if not candidate_names:
+        print(f"No XML files found in: {latest_root}")
+        return []
+
+    inserted_records: list[dict[str, Any]] = []
+    rows_to_insert: list[tuple[Any, ...]] = []
+    con = open_db()
+
+    for file_name in candidate_names:
+        if len(rows_to_insert) >= limit:
+            break
+        xml_file = latest_root / file_name
+        record = parse_full_dataset_record(xml_file)
+        if record is None:
+            continue
+
+        reg_no = (record.get("ApplicationNumber") or "").strip()
+        if not reg_no:
+            continue
+        if con.execute("SELECT 1 FROM marks WHERE reg_no = ?", (reg_no,)).fetchone():
+            continue
+
+        mark_text = (record.get("MarkVerbalElementText") or "").strip()
+        owner_name = (record.get("ApplicantName") or "").strip()
+        class_numbers = record.get("ClassNumbers") or []
+        goods_services = record.get("GoodsServicesDescription") or []
+        mark_feature = (record.get("MarkFeature") or "").strip()
+
+        rows_to_insert.append(
+            (
+                reg_no,
+                mark_text,
+                norm_text(mark_text),
+                owner_name,
+                infer_owner_type(owner_name),
+                "United Kingdom",
+                (record.get("IPOPublicMarkCurrentStatusCode") or "").strip(),
+                (record.get("KindMark") or "").strip(),
+                mark_feature or ("Word" if mark_text else ""),
+                (record.get("ApplicationDateTime") or "")[:10],
+                (record.get("PublicationDate") or "")[:10],
+                (record.get("RegistrationDate") or "")[:10],
+                "",
+                "",
+                ",".join(class_numbers),
+                " | ".join(goods_services),
+                str(xml_file),
+            )
+        )
+        inserted_records.append(
+            {
+                "reg_no": reg_no,
+                "mark_text": mark_text,
+                "status": (record.get("IPOPublicMarkCurrentStatusCode") or "").strip(),
+                "class_codes": class_numbers,
+                "source_file": str(xml_file),
+            }
+        )
+
+    if not rows_to_insert:
+        print("No FULL dataset records were prepared for insertion")
+        con.close()
+        return []
+
+    con.executemany(
+        """
+        INSERT OR IGNORE INTO marks(
+            reg_no, mark_text, mark_text_norm, owner_name, owner_type,
+            country, status, category, mark_type,
+            filed, published, registered, expired, renewal_due,
+            class_codes, goods_services, source_file
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        rows_to_insert,
+    )
+    con.commit()
+    con.close()
+
+    print(json.dumps(inserted_records, indent=2, ensure_ascii=False))
+    return inserted_records
 
 
 def _sql_literal(value: str) -> str:
@@ -420,6 +689,14 @@ def allow_broad_local_similarity(term_norm: str) -> bool:
     return len(tokens) == 1 and 4 <= len(tokens[0]) <= 12
 
 
+def should_try_fts(term_norm: str, multi_word_query: bool, candidates: list[sqlite3.Row]) -> bool:
+    if candidates:
+        return True
+    if multi_word_query:
+        return False
+    return allow_broad_local_similarity(term_norm)
+
+
 def local_similarity_score(term_norm: str, mark_norm: str) -> float:
     if not term_norm or not mark_norm:
         return 0.0
@@ -472,6 +749,9 @@ def open_db() -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA busy_timeout=5000")
     con.execute("PRAGMA case_sensitive_like=ON")
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("PRAGMA temp_store=MEMORY")
     ensure_runtime_schema(con)
     return con
 
@@ -596,6 +876,10 @@ def ensure_runtime_schema(con: sqlite3.Connection) -> None:
         )
         con.execute("CREATE INDEX IF NOT EXISTS idx_fallback_query_norm ON fallback_cache(query_norm)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_fallback_reg_no ON fallback_cache(reg_no)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_marks_reg_no ON marks(reg_no)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_marks_country ON marks(country)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_marks_status ON marks(status)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_marks_mark_text ON marks(mark_text)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_marks_mark_norm ON marks(mark_text_norm)")
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_marks_country_mark_text_norm ON marks(country, mark_text_norm)"
@@ -793,7 +1077,7 @@ def query_candidates(
     timings = {
         "exact_sql_ms": 0.0,
         "punctuation_exact_ms": 0.0,
-        "punctuation_prefix_ms": 0.0,
+        "prefix_sql_ms": 0.0,
         "fts_ms": 0.0,
         "python_scoring_ms": 0.0,
     }
@@ -878,7 +1162,7 @@ def query_candidates(
             """,
             (*countries, variant, upper, min(max_candidates, whole_prefix_limit)),
         ).fetchall()
-        timings["punctuation_prefix_ms"] += (perf_counter() - start) * 1000
+        timings["prefix_sql_ms"] += (perf_counter() - start) * 1000
         add_rows(rows)
         if candidates and has_high_similarity(candidates):
             return rank_rows(candidates), timings
@@ -907,7 +1191,7 @@ def query_candidates(
                     """,
                     (*countries, token, upper, min(max_candidates, phrase_prefix_limit), phrase_offset),
                 ).fetchall()
-                timings["punctuation_prefix_ms"] += (perf_counter() - start) * 1000
+                timings["prefix_sql_ms"] += (perf_counter() - start) * 1000
                 add_rows(rows)
                 if has_high_similarity(candidates) or len(candidates) >= max_candidates:
                     return rank_rows(candidates), timings
@@ -927,13 +1211,19 @@ def query_candidates(
             """,
             (*countries, token_prefix, upper, min(max_candidates, token_prefix_limit)),
         ).fetchall()
-        timings["punctuation_prefix_ms"] += (perf_counter() - start) * 1000
+        timings["prefix_sql_ms"] += (perf_counter() - start) * 1000
         add_rows(rows)
         if has_high_similarity(candidates) or len(candidates) >= max_candidates:
             return rank_rows(candidates), timings
 
+    # Single-word typo searches are usually already covered by the bounded
+    # prefix shortlist above. Skipping FTS here avoids a much more expensive
+    # scan on large local datasets while keeping the likely intended marks.
+    if candidates and not multi_word_query:
+        return rank_rows(candidates), timings
+
     # 5) Bounded token-prefix FTS search.
-    if ENABLE_LOCAL_SIMILARITY:
+    if ENABLE_LOCAL_SIMILARITY and should_try_fts(term_norm, multi_word_query, candidates):
         fts_tokens = build_candidate_prefix_terms(variants[0] if variants else term_norm)
         if not fts_tokens:
             raw_tokens = tokenize(variants[0] if variants else term_norm)
@@ -1554,10 +1844,11 @@ def check():
     stage_timings = {
         "exact_sql_ms": 0.0,
         "punctuation_exact_ms": 0.0,
-        "punctuation_prefix_ms": 0.0,
+        "prefix_sql_ms": 0.0,
         "fts_ms": 0.0,
         "python_scoring_ms": 0.0,
         "supplemental_lookup_ms": 0.0,
+        "fallback_search_ms": 0.0,
         "total_request_ms": 0.0,
     }
 
@@ -1586,7 +1877,7 @@ def check():
                 country,
                 limit=MAX_RETURNED_MATCHES,
             )
-            stage_timings["punctuation_prefix_ms"] += related_ms
+            stage_timings["prefix_sql_ms"] += related_ms
             seen_ids = {row["id"] for row in rows}
             for row in related_rows:
                 if row["id"] in seen_ids:
@@ -1609,6 +1900,7 @@ def check():
             result_source = "ukipo_fallback_cache"
             fallback_used = True
         else:
+            fallback_start = perf_counter()
             try:
                 fallback_results = search_ukipo_fallback(term, limit=UKIPO_FALLBACK_LIMIT)
                 if fallback_results:
@@ -1620,6 +1912,7 @@ def check():
                 fallback_error = f"UKIPO fallback request failed: HTTP {exc.code}"
             except Exception as exc:
                 fallback_error = f"UKIPO fallback request failed: {exc}"
+            stage_timings["fallback_search_ms"] += (perf_counter() - fallback_start) * 1000
 
     patent_rows = query_patents(con, term_norm) if include_patents else []
 
@@ -1646,12 +1939,13 @@ def check():
 
     stage_timings["total_request_ms"] = (perf_counter() - request_started) * 1000
     app.logger.info(
-        "check timing trademark=%r punctuation_fast=%s exact_sql=%.1fms punctuation_exact=%.1fms punctuation_prefix=%.1fms fts=%.1fms python_scoring=%.1fms supplemental=%.1fms total=%.1fms",
+        "check timing trademark=%r punctuation_fast=%s exact_search=%.1fms punctuation_exact=%.1fms prefix_search=%.1fms fallback_search=%.1fms fts=%.1fms ranking=%.1fms supplemental=%.1fms total=%.1fms",
         term,
         needs_runtime_normalized_search(term),
         stage_timings["exact_sql_ms"],
         stage_timings["punctuation_exact_ms"],
-        stage_timings["punctuation_prefix_ms"],
+        stage_timings["prefix_sql_ms"],
+        stage_timings["fallback_search_ms"],
         stage_timings["fts_ms"],
         stage_timings["python_scoring_ms"],
         stage_timings["supplemental_lookup_ms"],
