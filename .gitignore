@@ -14,3 +14,7 @@ __pycache__/
 
 # Keep deploy config text files
 !requirements.txt
+
+echo "data/*.sqlite" >> .gitignore
+echo "*.sqlite.part_*" >> .gitignoredata/*.sqlite
+*.sqlite.part_*
