@@ -38,6 +38,7 @@ UKIPO_FALLBACK_TIMEOUT = int(os.getenv("UKIPO_FALLBACK_TIMEOUT", "10"))
 UKIPO_FALLBACK_LIMIT = int(os.getenv("UKIPO_FALLBACK_LIMIT", "10"))
 UKIPO_FALLBACK_CACHE_DAYS = int(os.getenv("UKIPO_FALLBACK_CACHE_DAYS", "14"))
 MAX_SQL_CANDIDATES = max(20, int(os.getenv("MAX_SQL_CANDIDATES", "40")))
+MAX_RANK_CANDIDATES = min(200, max(20, int(os.getenv("MAX_RANK_CANDIDATES", "200"))))
 MAX_PYTHON_SCORE_ROWS = max(5, int(os.getenv("MAX_PYTHON_SCORE_ROWS", "15")))
 HIGH_SIMILARITY_CUTOFF = float(os.getenv("HIGH_SIMILARITY_CUTOFF", "0.9"))
 MAX_RETURNED_MATCHES = max(10, int(os.getenv("MAX_RETURNED_MATCHES", "25")))
@@ -1220,7 +1221,10 @@ def query_candidates(
     candidates: list[sqlite3.Row] = []
     seen_ids: set[int] = set()
     multi_word_query = len(tokenize(term_norm)) > 1
-    max_candidates = 60 if multi_word_query else min(max(limit, 1), MAX_SQL_CANDIDATES)
+    max_candidates = min(
+        MAX_RANK_CANDIDATES,
+        50 if multi_word_query else min(max(limit, 1), MAX_SQL_CANDIDATES),
+    )
     timings = {
         "exact_sql_ms": 0.0,
         "punctuation_exact_ms": 0.0,
@@ -1235,13 +1239,13 @@ def query_candidates(
     shared_phrase_tokens = [t for t in tokenize(term_norm) if len(t) >= 4 and t not in COMMON_SEARCH_TOKENS][:2]
     later_phrase_tokens = build_later_token_prefix_terms(term_norm)
     phrase_family_prefixes = build_phrase_family_prefixes(term_norm)
-    whole_prefix_limit = 12 if punctuation_fast_path else 20
-    first_token_backfill_limit = 40 if len(tokenize(term_norm)) > 1 else 0
-    phrase_family_limit = 30 if len(tokenize(term_norm)) > 1 else 0
-    token_prefix_limit = 10 if punctuation_fast_path else (8 if len(shared_phrase_tokens) > 1 else 15)
-    phrase_prefix_limit = 25 if len(shared_phrase_tokens) > 1 else 8
+    whole_prefix_limit = 10 if punctuation_fast_path else 16
+    first_token_backfill_limit = 24 if len(tokenize(term_norm)) > 1 else 0
+    phrase_family_limit = 18 if len(tokenize(term_norm)) > 1 else 0
+    token_prefix_limit = 8 if punctuation_fast_path else (6 if len(shared_phrase_tokens) > 1 else 10)
+    phrase_prefix_limit = 12 if len(shared_phrase_tokens) > 1 else 6
     phrase_prefix_offsets = (0, 25) if len(shared_phrase_tokens) > 1 else (0,)
-    fts_limit = 8 if punctuation_fast_path else 10
+    fts_limit = 6 if punctuation_fast_path else 8
 
     def add_rows(rows: list[sqlite3.Row]) -> None:
         for row in rows:
@@ -1273,6 +1277,20 @@ def query_candidates(
     def has_high_similarity(rows: list[sqlite3.Row]) -> bool:
         for row in rows[:MAX_PYTHON_SCORE_ROWS]:
             if local_similarity_score(term_norm, row["mark_text_norm"] or "") >= HIGH_SIMILARITY_CUTOFF:
+                return True
+        return False
+
+    def has_multiword_signal(rows: list[sqlite3.Row]) -> bool:
+        if not multi_word_query:
+            return False
+        for row in rows[:MAX_PYTHON_SCORE_ROWS]:
+            mark_norm = row["mark_text_norm"] or ""
+            sim = local_similarity_score(term_norm, mark_norm)
+            if phrase_family_match(term_norm, mark_norm):
+                return True
+            if first_and_later_token_match(term_norm, mark_norm):
+                return True
+            if sim >= 0.6:
                 return True
         return False
 
@@ -1396,6 +1414,9 @@ def query_candidates(
         add_rows(rows)
         if has_high_similarity(candidates) or len(candidates) >= max_candidates:
             return rank_rows(candidates), timings
+
+    if multi_word_query and candidates and (has_multiword_signal(candidates) or len(candidates) >= min(max_candidates, 18)):
+        return rank_rows(candidates), timings
 
     # 3) For multi-word phrases, pull in a small set of phrase marks sharing key tokens.
     if len(shared_phrase_tokens) > 1:
@@ -2268,6 +2289,10 @@ def check():
     patent_rows = query_patents(con, term_norm) if include_patents else []
 
     rows = dedupe_mark_rows(rows)
+    pre_rank_candidate_count = len(rows)
+    if len(rows) > MAX_RANK_CANDIDATES:
+        rows = rows[:MAX_RANK_CANDIDATES]
+    post_cap_candidate_count = len(rows)
     matches = [summarize_mark(r, term_norm) for r in rows]
     for match in matches:
         match["data_source"] = result_source if result_source != "local_database" else "local_database"
@@ -2290,7 +2315,7 @@ def check():
 
     stage_timings["total_request_ms"] = (perf_counter() - request_started) * 1000
     app.logger.info(
-        "check timing trademark=%r punctuation_fast=%s exact_search=%.1fms punctuation_exact=%.1fms prefix_search=%.1fms fallback_search=%.1fms fts=%.1fms ranking=%.1fms supplemental=%.1fms total=%.1fms candidates(exact=%.0f prefix=%.0f fts=%.0f final=%d)",
+        "check timing trademark=%r punctuation_fast=%s exact_search=%.1fms punctuation_exact=%.1fms prefix_search=%.1fms fallback_search=%.1fms fts=%.1fms ranking=%.1fms supplemental=%.1fms total=%.1fms candidates(exact=%.0f prefix=%.0f fts=%.0f pre_rank=%d post_cap=%d final=%d)",
         term,
         needs_runtime_normalized_search(term),
         stage_timings["exact_sql_ms"],
@@ -2304,6 +2329,8 @@ def check():
         stage_timings["exact_candidate_count"],
         stage_timings["prefix_candidate_count"],
         stage_timings["fts_candidate_count"],
+        pre_rank_candidate_count,
+        post_cap_candidate_count,
         len(matches),
     )
 
