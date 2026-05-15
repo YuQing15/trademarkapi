@@ -38,7 +38,8 @@ UKIPO_FALLBACK_TIMEOUT = int(os.getenv("UKIPO_FALLBACK_TIMEOUT", "10"))
 UKIPO_FALLBACK_LIMIT = int(os.getenv("UKIPO_FALLBACK_LIMIT", "10"))
 UKIPO_FALLBACK_CACHE_DAYS = int(os.getenv("UKIPO_FALLBACK_CACHE_DAYS", "14"))
 MAX_SQL_CANDIDATES = max(20, int(os.getenv("MAX_SQL_CANDIDATES", "40")))
-MAX_RANK_CANDIDATES = min(200, max(20, int(os.getenv("MAX_RANK_CANDIDATES", "200"))))
+MAX_RANK_CANDIDATES = min(100, max(20, int(os.getenv("MAX_RANK_CANDIDATES", "100"))))
+CHECK_EXPANSION_BUDGET_MS = max(100, int(os.getenv("CHECK_EXPANSION_BUDGET_MS", "350")))
 MAX_PYTHON_SCORE_ROWS = max(5, int(os.getenv("MAX_PYTHON_SCORE_ROWS", "15")))
 HIGH_SIMILARITY_CUTOFF = float(os.getenv("HIGH_SIMILARITY_CUTOFF", "0.9"))
 MAX_RETURNED_MATCHES = max(10, int(os.getenv("MAX_RETURNED_MATCHES", "25")))
@@ -693,7 +694,7 @@ def allow_broad_local_similarity(term_norm: str) -> bool:
 
 def should_try_fts(term_norm: str, multi_word_query: bool, candidates: list[sqlite3.Row]) -> bool:
     if candidates:
-        return True
+        return False
     if multi_word_query:
         return False
     return allow_broad_local_similarity(term_norm)
@@ -1214,6 +1215,7 @@ def query_candidates(
     limit: int = 25,
     skip_exact_search: bool = False,
 ) -> tuple[list[sqlite3.Row], dict[str, float]]:
+    query_started = perf_counter()
     countries = expanded_countries_for_query(country)
     placeholders = ",".join(["?"] * len(countries))
     variants = search_norm_variants(term, term_norm)
@@ -1223,7 +1225,7 @@ def query_candidates(
     multi_word_query = len(tokenize(term_norm)) > 1
     max_candidates = min(
         MAX_RANK_CANDIDATES,
-        50 if multi_word_query else min(max(limit, 1), MAX_SQL_CANDIDATES),
+        40 if multi_word_query else min(max(limit, 1), MAX_SQL_CANDIDATES),
     )
     timings = {
         "exact_sql_ms": 0.0,
@@ -1239,13 +1241,13 @@ def query_candidates(
     shared_phrase_tokens = [t for t in tokenize(term_norm) if len(t) >= 4 and t not in COMMON_SEARCH_TOKENS][:2]
     later_phrase_tokens = build_later_token_prefix_terms(term_norm)
     phrase_family_prefixes = build_phrase_family_prefixes(term_norm)
-    whole_prefix_limit = 10 if punctuation_fast_path else 16
-    first_token_backfill_limit = 24 if len(tokenize(term_norm)) > 1 else 0
-    phrase_family_limit = 18 if len(tokenize(term_norm)) > 1 else 0
-    token_prefix_limit = 8 if punctuation_fast_path else (6 if len(shared_phrase_tokens) > 1 else 10)
-    phrase_prefix_limit = 12 if len(shared_phrase_tokens) > 1 else 6
+    whole_prefix_limit = 8 if punctuation_fast_path else 12
+    first_token_backfill_limit = 12 if len(tokenize(term_norm)) > 1 else 0
+    phrase_family_limit = 10 if len(tokenize(term_norm)) > 1 else 0
+    token_prefix_limit = 5
+    phrase_prefix_limit = 8 if len(shared_phrase_tokens) > 1 else 5
     phrase_prefix_offsets = (0, 25) if len(shared_phrase_tokens) > 1 else (0,)
-    fts_limit = 6 if punctuation_fast_path else 8
+    fts_limit = 4 if punctuation_fast_path else 5
 
     def add_rows(rows: list[sqlite3.Row]) -> None:
         for row in rows:
@@ -1293,6 +1295,9 @@ def query_candidates(
             if sim >= 0.6:
                 return True
         return False
+
+    def expansion_budget_exhausted() -> bool:
+        return ((perf_counter() - query_started) * 1000) >= CHECK_EXPANSION_BUDGET_MS
 
     # 1) Exact normalized match (fast, index-friendly)
     if not skip_exact_search:
@@ -1357,6 +1362,10 @@ def query_candidates(
         # 3a) Pull a richer bounded family of phrase prefixes, e.g.:
         # "lucky buddhist" -> "lucky buddh...", "lucky bud...", "lucky b..."
         for family_prefix in phrase_family_prefixes:
+            if expansion_budget_exhausted():
+                if candidates:
+                    return rank_rows(candidates), timings
+                return [], timings
             upper = prefix_upper_bound(family_prefix)
             start = perf_counter()
             rows = con.execute(
@@ -1377,6 +1386,10 @@ def query_candidates(
                 return rank_rows(candidates), timings
 
         for later_token in later_phrase_tokens:
+            if expansion_budget_exhausted():
+                if candidates:
+                    return rank_rows(candidates), timings
+                return [], timings
             start = perf_counter()
             rows = con.execute(
                 f"""
@@ -1388,7 +1401,7 @@ def query_candidates(
                   AND instr(m.mark_text_norm, ?) > 0
                 LIMIT ?
                 """,
-                (*countries, first_token, first_upper, later_token, min(max_candidates, 20)),
+                (*countries, first_token, first_upper, later_token, min(max_candidates, 8)),
             ).fetchall()
             timings["prefix_sql_ms"] += (perf_counter() - start) * 1000
             timings["prefix_candidate_count"] += len(rows)
@@ -1397,6 +1410,10 @@ def query_candidates(
                 return rank_rows(candidates), timings
 
         # 3b) Bounded richer backfill for first-token phrase families, e.g. "lucky ..."
+        if expansion_budget_exhausted():
+            if candidates:
+                return rank_rows(candidates), timings
+            return [], timings
         start = perf_counter()
         rows = con.execute(
             f"""
@@ -1417,12 +1434,22 @@ def query_candidates(
 
     if multi_word_query and candidates and (has_multiword_signal(candidates) or len(candidates) >= min(max_candidates, 18)):
         return rank_rows(candidates), timings
+    if candidates and expansion_budget_exhausted():
+        return rank_rows(candidates), timings
 
     # 3) For multi-word phrases, pull in a small set of phrase marks sharing key tokens.
     if len(shared_phrase_tokens) > 1:
         for token in shared_phrase_tokens:
+            if expansion_budget_exhausted():
+                if candidates:
+                    return rank_rows(candidates), timings
+                return [], timings
             upper = prefix_upper_bound(token)
             for phrase_offset in phrase_prefix_offsets:
+                if expansion_budget_exhausted():
+                    if candidates:
+                        return rank_rows(candidates), timings
+                    return [], timings
                 start = perf_counter()
                 rows = con.execute(
                     f"""
@@ -1444,6 +1471,10 @@ def query_candidates(
 
     # 4) Token-prefix range search for typo tolerance.
     for token_prefix in token_prefix_terms:
+        if expansion_budget_exhausted():
+            if candidates:
+                return rank_rows(candidates), timings
+            return [], timings
         upper = prefix_upper_bound(token_prefix)
         start = perf_counter()
         rows = con.execute(
@@ -1470,7 +1501,7 @@ def query_candidates(
         return rank_rows(candidates), timings
 
     # 5) Bounded token-prefix FTS search.
-    if ENABLE_LOCAL_SIMILARITY and should_try_fts(term_norm, multi_word_query, candidates):
+    if ENABLE_LOCAL_SIMILARITY and not expansion_budget_exhausted() and should_try_fts(term_norm, multi_word_query, candidates):
         fts_tokens = build_candidate_prefix_terms(variants[0] if variants else term_norm)
         if not fts_tokens:
             raw_tokens = tokenize(variants[0] if variants else term_norm)
@@ -1478,6 +1509,8 @@ def query_candidates(
                 fts_tokens = [raw_tokens[0][:4]]
 
         for token in fts_tokens[:2]:
+            if expansion_budget_exhausted():
+                break
             try:
                 start = perf_counter()
                 rows = con.execute(
