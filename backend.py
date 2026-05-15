@@ -32,20 +32,22 @@ print("UKIPO_DATA_PATH:", UKIPO_DATA_PATH)
 DB_PATH = Path(DATABASE_PATH)
 DB_URL = os.getenv("TRADEMARK_DB_URL", "").strip()
 SUPPLEMENTAL_MARKS_PATH = Path(os.getenv("SUPPLEMENTAL_MARKS_PATH", "data/supplemental_marks.json"))
+RUNNING_ON_RENDER = bool(os.getenv("RENDER")) or bool(os.getenv("RENDER_SERVICE_ID"))
 ENABLE_UKIPO_FALLBACK = os.getenv("ENABLE_UKIPO_FALLBACK", "0") == "1"
 ENABLE_LOCAL_SIMILARITY = os.getenv("ENABLE_LOCAL_SIMILARITY", "1") == "1"
+ENABLE_FTS = os.getenv("ENABLE_FTS", "0" if RUNNING_ON_RENDER else "1") == "1"
+ENABLE_BROAD_BACKFILL = os.getenv("ENABLE_BROAD_BACKFILL", "0") == "1"
 UKIPO_FALLBACK_TIMEOUT = int(os.getenv("UKIPO_FALLBACK_TIMEOUT", "10"))
 UKIPO_FALLBACK_LIMIT = int(os.getenv("UKIPO_FALLBACK_LIMIT", "10"))
 UKIPO_FALLBACK_CACHE_DAYS = int(os.getenv("UKIPO_FALLBACK_CACHE_DAYS", "14"))
 MAX_SQL_CANDIDATES = max(20, int(os.getenv("MAX_SQL_CANDIDATES", "40")))
-MAX_RANK_CANDIDATES = min(100, max(20, int(os.getenv("MAX_RANK_CANDIDATES", "100"))))
+MAX_RANK_CANDIDATES = min(50, max(20, int(os.getenv("MAX_RANK_CANDIDATES", "50"))))
 CHECK_EXPANSION_BUDGET_MS = max(100, int(os.getenv("CHECK_EXPANSION_BUDGET_MS", "350")))
 MAX_PYTHON_SCORE_ROWS = max(5, int(os.getenv("MAX_PYTHON_SCORE_ROWS", "15")))
 HIGH_SIMILARITY_CUTOFF = float(os.getenv("HIGH_SIMILARITY_CUTOFF", "0.9"))
 MAX_RETURNED_MATCHES = max(10, int(os.getenv("MAX_RETURNED_MATCHES", "25")))
 DEFAULT_SIMILAR_LIMIT = max(1, int(os.getenv("DEFAULT_SIMILAR_LIMIT", "25")))
 MAX_SIMILAR_LIMIT = max(DEFAULT_SIMILAR_LIMIT, int(os.getenv("MAX_SIMILAR_LIMIT", "25")))
-RUNNING_ON_RENDER = bool(os.getenv("RENDER")) or bool(os.getenv("RENDER_SERVICE_ID"))
 ENABLE_STARTUP_WARMUP = os.getenv("ENABLE_STARTUP_WARMUP", "0" if RUNNING_ON_RENDER else "1") == "1"
 DEBUG_RANKING = os.getenv("DEBUG_RANKING", "0") == "1"
 MARK_LIGHT_SELECT = """
@@ -1236,18 +1238,21 @@ def query_candidates(
         "exact_candidate_count": 0.0,
         "prefix_candidate_count": 0.0,
         "fts_candidate_count": 0.0,
+        "skipped_broad_backfill": 0.0,
+        "skipped_fts": 0.0,
+        "skipped_remote_fallback": 0.0,
     }
     token_prefix_terms = build_candidate_prefix_terms(term_norm)
     shared_phrase_tokens = [t for t in tokenize(term_norm) if len(t) >= 4 and t not in COMMON_SEARCH_TOKENS][:2]
     later_phrase_tokens = build_later_token_prefix_terms(term_norm)
     phrase_family_prefixes = build_phrase_family_prefixes(term_norm)
-    whole_prefix_limit = 8 if punctuation_fast_path else 12
-    first_token_backfill_limit = 12 if len(tokenize(term_norm)) > 1 else 0
-    phrase_family_limit = 10 if len(tokenize(term_norm)) > 1 else 0
+    whole_prefix_limit = 6 if punctuation_fast_path else 8
+    first_token_backfill_limit = 10 if (len(tokenize(term_norm)) > 1 and ENABLE_BROAD_BACKFILL) else 0
+    phrase_family_limit = 8 if len(tokenize(term_norm)) > 1 else 0
     token_prefix_limit = 5
-    phrase_prefix_limit = 8 if len(shared_phrase_tokens) > 1 else 5
-    phrase_prefix_offsets = (0, 25) if len(shared_phrase_tokens) > 1 else (0,)
-    fts_limit = 4 if punctuation_fast_path else 5
+    phrase_prefix_limit = 5
+    phrase_prefix_offsets = (0,)
+    fts_limit = 3 if punctuation_fast_path else 4
 
     def add_rows(rows: list[sqlite3.Row]) -> None:
         for row in rows:
@@ -1385,7 +1390,7 @@ def query_candidates(
             if has_high_similarity(candidates) or len(candidates) >= max_candidates:
                 return rank_rows(candidates), timings
 
-        for later_token in later_phrase_tokens:
+        for later_token in later_phrase_tokens[:2]:
             if expansion_budget_exhausted():
                 if candidates:
                     return rank_rows(candidates), timings
@@ -1401,7 +1406,7 @@ def query_candidates(
                   AND instr(m.mark_text_norm, ?) > 0
                 LIMIT ?
                 """,
-                (*countries, first_token, first_upper, later_token, min(max_candidates, 8)),
+                (*countries, first_token, first_upper, later_token, min(max_candidates, 5)),
             ).fetchall()
             timings["prefix_sql_ms"] += (perf_counter() - start) * 1000
             timings["prefix_candidate_count"] += len(rows)
@@ -1409,32 +1414,43 @@ def query_candidates(
             if has_high_similarity(candidates) or len(candidates) >= max_candidates:
                 return rank_rows(candidates), timings
 
-        # 3b) Bounded richer backfill for first-token phrase families, e.g. "lucky ..."
-        if expansion_budget_exhausted():
-            if candidates:
-                return rank_rows(candidates), timings
-            return [], timings
-        start = perf_counter()
-        rows = con.execute(
-            f"""
-            SELECT {MARK_LIGHT_SELECT}
-            FROM marks m
-            WHERE m.country IN ({placeholders})
-              AND m.mark_text_norm >= ?
-              AND m.mark_text_norm < ?
-            LIMIT ?
-            """,
-            (*countries, first_token, first_upper, min(max_candidates, first_token_backfill_limit)),
-        ).fetchall()
-        timings["prefix_sql_ms"] += (perf_counter() - start) * 1000
-        timings["prefix_candidate_count"] += len(rows)
-        add_rows(rows)
-        if has_high_similarity(candidates) or len(candidates) >= max_candidates:
+        if candidates:
+            timings["skipped_broad_backfill"] = 1.0
             return rank_rows(candidates), timings
+
+        # 3b) Optional bounded first-token backfill, disabled by default on Render.
+        if first_token_backfill_limit > 0:
+            if expansion_budget_exhausted():
+                if candidates:
+                    return rank_rows(candidates), timings
+                return [], timings
+            start = perf_counter()
+            rows = con.execute(
+                f"""
+                SELECT {MARK_LIGHT_SELECT}
+                FROM marks m
+                WHERE m.country IN ({placeholders})
+                  AND m.mark_text_norm >= ?
+                  AND m.mark_text_norm < ?
+                LIMIT ?
+                """,
+                (*countries, first_token, first_upper, min(max_candidates, first_token_backfill_limit)),
+            ).fetchall()
+            timings["prefix_sql_ms"] += (perf_counter() - start) * 1000
+            timings["prefix_candidate_count"] += len(rows)
+            add_rows(rows)
+            if has_high_similarity(candidates) or len(candidates) >= max_candidates:
+                return rank_rows(candidates), timings
+        else:
+            timings["skipped_broad_backfill"] = 1.0
 
     if multi_word_query and candidates and (has_multiword_signal(candidates) or len(candidates) >= min(max_candidates, 18)):
         return rank_rows(candidates), timings
     if candidates and expansion_budget_exhausted():
+        return rank_rows(candidates), timings
+
+    if multi_word_query and candidates:
+        timings["skipped_fts"] = 1.0
         return rank_rows(candidates), timings
 
     # 3) For multi-word phrases, pull in a small set of phrase marks sharing key tokens.
@@ -1501,7 +1517,7 @@ def query_candidates(
         return rank_rows(candidates), timings
 
     # 5) Bounded token-prefix FTS search.
-    if ENABLE_LOCAL_SIMILARITY and not expansion_budget_exhausted() and should_try_fts(term_norm, multi_word_query, candidates):
+    if ENABLE_LOCAL_SIMILARITY and ENABLE_FTS and not expansion_budget_exhausted() and should_try_fts(term_norm, multi_word_query, candidates):
         fts_tokens = build_candidate_prefix_terms(variants[0] if variants else term_norm)
         if not fts_tokens:
             raw_tokens = tokenize(variants[0] if variants else term_norm)
@@ -1531,6 +1547,8 @@ def query_candidates(
             add_rows(rows)
             if has_high_similarity(candidates) or len(candidates) >= max_candidates:
                 break
+    else:
+        timings["skipped_fts"] = 1.0
 
     if not candidates:
         return [], timings
@@ -2318,6 +2336,10 @@ def check():
             except Exception as exc:
                 fallback_error = f"UKIPO fallback request failed: {exc}"
             stage_timings["fallback_search_ms"] += (perf_counter() - fallback_start) * 1000
+    elif rows:
+        stage_timings["skipped_remote_fallback"] = 1.0
+    elif not should_try_remote_fallback(term_norm):
+        stage_timings["skipped_remote_fallback"] = 1.0
 
     patent_rows = query_patents(con, term_norm) if include_patents else []
 
@@ -2348,7 +2370,7 @@ def check():
 
     stage_timings["total_request_ms"] = (perf_counter() - request_started) * 1000
     app.logger.info(
-        "check timing trademark=%r punctuation_fast=%s exact_search=%.1fms punctuation_exact=%.1fms prefix_search=%.1fms fallback_search=%.1fms fts=%.1fms ranking=%.1fms supplemental=%.1fms total=%.1fms candidates(exact=%.0f prefix=%.0f fts=%.0f pre_rank=%d post_cap=%d final=%d)",
+        "check timing trademark=%r punctuation_fast=%s exact_search=%.1fms punctuation_exact=%.1fms prefix_search=%.1fms fallback_search=%.1fms fts=%.1fms ranking=%.1fms supplemental=%.1fms total=%.1fms candidates(exact=%.0f prefix=%.0f fts=%.0f pre_rank=%d post_cap=%d final=%d skipped(backfill=%.0f fts=%.0f remote=%.0f))",
         term,
         needs_runtime_normalized_search(term),
         stage_timings["exact_sql_ms"],
@@ -2365,6 +2387,9 @@ def check():
         pre_rank_candidate_count,
         post_cap_candidate_count,
         len(matches),
+        stage_timings.get("skipped_broad_backfill", 0.0),
+        stage_timings.get("skipped_fts", 0.0),
+        stage_timings.get("skipped_remote_fallback", 0.0),
     )
 
     reference_classes = determine_reference_classes(matches, class_filter, term_norm)
