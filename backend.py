@@ -48,7 +48,8 @@ HIGH_SIMILARITY_CUTOFF = float(os.getenv("HIGH_SIMILARITY_CUTOFF", "0.9"))
 MAX_RETURNED_MATCHES = max(10, int(os.getenv("MAX_RETURNED_MATCHES", "25")))
 DEFAULT_SIMILAR_LIMIT = max(1, int(os.getenv("DEFAULT_SIMILAR_LIMIT", "25")))
 MAX_SIMILAR_LIMIT = max(DEFAULT_SIMILAR_LIMIT, int(os.getenv("MAX_SIMILAR_LIMIT", "25")))
-ENABLE_STARTUP_WARMUP = os.getenv("ENABLE_STARTUP_WARMUP", "0" if RUNNING_ON_RENDER else "1") == "1"
+GOODS_SERVICES_MAX_CLASS_CHARS = max(200, int(os.getenv("GOODS_SERVICES_MAX_CLASS_CHARS", "1000")))
+ENABLE_STARTUP_WARMUP = os.getenv("ENABLE_STARTUP_WARMUP", "1") == "1"
 DEBUG_RANKING = os.getenv("DEBUG_RANKING", "0") == "1"
 MARK_LIGHT_SELECT = """
     m.id,
@@ -695,23 +696,11 @@ def allow_broad_local_similarity(term_norm: str) -> bool:
 
 
 def should_try_fts(term_norm: str, multi_word_query: bool, candidates: list[sqlite3.Row]) -> bool:
-    if candidates:
-        return False
-    if multi_word_query:
-        return False
-    return allow_broad_local_similarity(term_norm)
+    return False
 
 
 def should_try_remote_fallback(term_norm: str) -> bool:
-    tokens = tokenize(term_norm)
-    if not tokens:
-        return False
-    if len(tokens) > 3:
-        return False
-    joined = "".join(tokens)
-    if len(joined) < 4 or len(joined) > 18:
-        return False
-    return True
+    return False
 
 
 def token_root(token: str) -> str:
@@ -917,6 +906,7 @@ def run_lightweight_warmup(*, allow_index_download: bool = False) -> tuple[bool,
             country_available(con, "United Kingdom")
             query_exact_candidates(con, "microsoft", normalize_text("microsoft"), "United Kingdom", limit=1)
             query_related_prefix_candidates(con, "micro", "United Kingdom", limit=1)
+            con.execute("SELECT goods_services FROM marks WHERE goods_services IS NOT NULL AND goods_services != '' LIMIT 1").fetchone()
         finally:
             con.close()
     except Exception as exc:
@@ -1241,17 +1231,19 @@ def query_candidates(
         "skipped_broad_backfill": 0.0,
         "skipped_fts": 0.0,
         "skipped_remote_fallback": 0.0,
+        "ran_exact_stage": 0.0,
+        "ran_prefix_stage": 0.0,
+        "ran_phrase_family_stage": 0.0,
+        "ran_first_token_stage": 0.0,
     }
     token_prefix_terms = build_candidate_prefix_terms(term_norm)
     shared_phrase_tokens = [t for t in tokenize(term_norm) if len(t) >= 4 and t not in COMMON_SEARCH_TOKENS][:2]
     later_phrase_tokens = build_later_token_prefix_terms(term_norm)
     phrase_family_prefixes = build_phrase_family_prefixes(term_norm)
     whole_prefix_limit = 6 if punctuation_fast_path else 8
-    first_token_backfill_limit = 10 if (len(tokenize(term_norm)) > 1 and ENABLE_BROAD_BACKFILL) else 0
+    first_token_backfill_limit = 8 if len(tokenize(term_norm)) > 1 else 0
     phrase_family_limit = 8 if len(tokenize(term_norm)) > 1 else 0
     token_prefix_limit = 5
-    phrase_prefix_limit = 5
-    phrase_prefix_offsets = (0,)
     fts_limit = 3 if punctuation_fast_path else 4
 
     def add_rows(rows: list[sqlite3.Row]) -> None:
@@ -1306,6 +1298,7 @@ def query_candidates(
 
     # 1) Exact normalized match (fast, index-friendly)
     if not skip_exact_search:
+        timings["ran_exact_stage"] = 1.0
         for variant in variants:
             start = perf_counter()
             rows = con.execute(
@@ -1329,6 +1322,7 @@ def query_candidates(
                 return rank_rows(candidates), timings
 
     # 2) Prefix match only (fast, index-friendly)
+    timings["ran_prefix_stage"] = 1.0
     for variant in variants:
         if len(variant) < 4:
             continue
@@ -1357,15 +1351,13 @@ def query_candidates(
     if punctuation_fast_path:
         return [], timings
 
-    # 3) For multi-word phrase searches, prefer candidates that contain the first
-    # token plus a later/query-specific token or variant.
+    # 3) Multi-word query: only use prefix-friendly phrase family and first-token prefix.
     term_tokens = tokenize(term_norm)
     if len(term_tokens) > 1 and len(term_tokens[0]) >= 4:
         first_token = term_tokens[0]
         first_upper = prefix_upper_bound(first_token)
 
-        # 3a) Pull a richer bounded family of phrase prefixes, e.g.:
-        # "lucky buddhist" -> "lucky buddh...", "lucky bud...", "lucky b..."
+        timings["ran_phrase_family_stage"] = 1.0
         for family_prefix in phrase_family_prefixes:
             if expansion_budget_exhausted():
                 if candidates:
@@ -1387,38 +1379,10 @@ def query_candidates(
             timings["prefix_sql_ms"] += (perf_counter() - start) * 1000
             timings["prefix_candidate_count"] += len(rows)
             add_rows(rows)
-            if has_high_similarity(candidates) or len(candidates) >= max_candidates:
+            if candidates:
                 return rank_rows(candidates), timings
 
-        for later_token in later_phrase_tokens[:2]:
-            if expansion_budget_exhausted():
-                if candidates:
-                    return rank_rows(candidates), timings
-                return [], timings
-            start = perf_counter()
-            rows = con.execute(
-                f"""
-                SELECT {MARK_LIGHT_SELECT}
-                FROM marks m
-                WHERE m.country IN ({placeholders})
-                  AND m.mark_text_norm >= ?
-                  AND m.mark_text_norm < ?
-                  AND instr(m.mark_text_norm, ?) > 0
-                LIMIT ?
-                """,
-                (*countries, first_token, first_upper, later_token, min(max_candidates, 5)),
-            ).fetchall()
-            timings["prefix_sql_ms"] += (perf_counter() - start) * 1000
-            timings["prefix_candidate_count"] += len(rows)
-            add_rows(rows)
-            if has_high_similarity(candidates) or len(candidates) >= max_candidates:
-                return rank_rows(candidates), timings
-
-        if candidates:
-            timings["skipped_broad_backfill"] = 1.0
-            return rank_rows(candidates), timings
-
-        # 3b) Optional bounded first-token backfill, disabled by default on Render.
+        timings["ran_first_token_stage"] = 1.0
         if first_token_backfill_limit > 0:
             if expansion_budget_exhausted():
                 if candidates:
@@ -1439,54 +1403,21 @@ def query_candidates(
             timings["prefix_sql_ms"] += (perf_counter() - start) * 1000
             timings["prefix_candidate_count"] += len(rows)
             add_rows(rows)
-            if has_high_similarity(candidates) or len(candidates) >= max_candidates:
-                return rank_rows(candidates), timings
         else:
             timings["skipped_broad_backfill"] = 1.0
 
-    if multi_word_query and candidates and (has_multiword_signal(candidates) or len(candidates) >= min(max_candidates, 18)):
-        return rank_rows(candidates), timings
+        if candidates:
+            timings["skipped_broad_backfill"] = 1.0
+            timings["skipped_fts"] = 1.0
+            return rank_rows(candidates), timings
+
+        return [], timings
+
     if candidates and expansion_budget_exhausted():
         return rank_rows(candidates), timings
 
-    if multi_word_query and candidates:
-        timings["skipped_fts"] = 1.0
-        return rank_rows(candidates), timings
-
-    # 3) For multi-word phrases, pull in a small set of phrase marks sharing key tokens.
-    if len(shared_phrase_tokens) > 1:
-        for token in shared_phrase_tokens:
-            if expansion_budget_exhausted():
-                if candidates:
-                    return rank_rows(candidates), timings
-                return [], timings
-            upper = prefix_upper_bound(token)
-            for phrase_offset in phrase_prefix_offsets:
-                if expansion_budget_exhausted():
-                    if candidates:
-                        return rank_rows(candidates), timings
-                    return [], timings
-                start = perf_counter()
-                rows = con.execute(
-                    f"""
-                    SELECT {MARK_LIGHT_SELECT}
-                    FROM marks m
-                    WHERE m.country IN ({placeholders})
-                      AND m.mark_text_norm >= ?
-                      AND m.mark_text_norm < ?
-                      AND instr(m.mark_text_norm, ' ') > 0
-                    LIMIT ? OFFSET ?
-                    """,
-                    (*countries, token, upper, min(max_candidates, phrase_prefix_limit), phrase_offset),
-                ).fetchall()
-                timings["prefix_sql_ms"] += (perf_counter() - start) * 1000
-                timings["prefix_candidate_count"] += len(rows)
-                add_rows(rows)
-                if has_high_similarity(candidates) or len(candidates) >= max_candidates:
-                    return rank_rows(candidates), timings
-
-    # 4) Token-prefix range search for typo tolerance.
-    for token_prefix in token_prefix_terms:
+    timings["ran_first_token_stage"] = 1.0
+    for token_prefix in token_prefix_terms[:1]:
         if expansion_budget_exhausted():
             if candidates:
                 return rank_rows(candidates), timings
@@ -1507,14 +1438,8 @@ def query_candidates(
         timings["prefix_sql_ms"] += (perf_counter() - start) * 1000
         timings["prefix_candidate_count"] += len(rows)
         add_rows(rows)
-        if has_high_similarity(candidates) or len(candidates) >= max_candidates:
+        if candidates:
             return rank_rows(candidates), timings
-
-    # Single-word typo searches are usually already covered by the bounded
-    # prefix shortlist above. Skipping FTS here avoids a much more expensive
-    # scan on large local datasets while keeping the likely intended marks.
-    if candidates and not multi_word_query:
-        return rank_rows(candidates), timings
 
     # 5) Bounded token-prefix FTS search.
     if ENABLE_LOCAL_SIMILARITY and ENABLE_FTS and not expansion_budget_exhausted() and should_try_fts(term_norm, multi_word_query, candidates):
@@ -1766,7 +1691,30 @@ def fetch_mark_details_by_ids(con: sqlite3.Connection, ids: list[int]) -> dict[i
         return {}
     placeholders = ",".join(["?"] * len(ids))
     rows = con.execute(
-        "SELECT * FROM marks WHERE id IN (" + placeholders + ")",
+        """
+        SELECT
+            id,
+            reg_no,
+            mark_text,
+            mark_text_norm,
+            owner_name,
+            owner_type,
+            country,
+            status,
+            category,
+            mark_type,
+            filed,
+            registered,
+            expired,
+            renewal_due,
+            class_codes,
+            goods_services,
+            source_url
+        FROM marks
+        WHERE id IN (
+        """
+        + placeholders
+        + ")",
         tuple(ids),
     ).fetchall()
     return {int(row["id"]): row for row in rows}
@@ -1898,6 +1846,22 @@ def clean_goods_services_display(text: str) -> str:
     return text
 
 
+def trim_goods_services_per_class(text: str, max_chars: int = GOODS_SERVICES_MAX_CLASS_CHARS) -> str:
+    text = (text or "").strip()
+    if not text or len(text) <= max_chars:
+        return text
+
+    parts = [part.strip() for part in text.split(" | ")]
+    trimmed_parts: list[str] = []
+    for part in parts:
+        if len(part) <= max_chars:
+            trimmed_parts.append(part)
+            continue
+        shortened = clean_goods_services_display(part[:max_chars].rstrip())
+        trimmed_parts.append(shortened if shortened else part[:max_chars].rstrip() + " …")
+    return " | ".join(trimmed_parts)
+
+
 def summarize_mark(row: sqlite3.Row, term_norm: str) -> dict[str, Any]:
     mark_text = row["mark_text"] or ""
     mark_norm = norm_text(mark_text)
@@ -1925,7 +1889,9 @@ def summarize_mark(row: sqlite3.Row, term_norm: str) -> dict[str, Any]:
         "age_years": years_since(filed) if filed else None,
         "active": is_active(row["status"], expired),
         "class_codes": (row["class_codes"] or "").split(",") if row["class_codes"] else [],
-        "goods_services": clean_goods_services_display(row["goods_services"]) if "goods_services" in row.keys() else "",
+        "goods_services": trim_goods_services_per_class(
+            clean_goods_services_display(row["goods_services"]) if "goods_services" in row.keys() else ""
+        ),
         "source_url": row["source_url"] if "source_url" in row.keys() else "",
         "data_source": row["data_source"] if "data_source" in row.keys() else "local_database",
         "similarity": round(sim, 4),
@@ -2252,7 +2218,9 @@ def check():
         return jsonify({"error": "Please enter at least 3 characters."}), 400
 
     term_norm = normalize_text(term)
+    db_open_started = perf_counter()
     con = open_db()
+    db_open_ms = (perf_counter() - db_open_started) * 1000
     if not country_available(con, country) and not fallback_allowed(country):
         con.close()
         return jsonify(
@@ -2270,6 +2238,7 @@ def check():
         "supplemental_lookup_ms": 0.0,
         "fallback_search_ms": 0.0,
         "total_request_ms": 0.0,
+        "db_open_ms": db_open_ms,
         "exact_candidate_count": 0.0,
         "prefix_candidate_count": 0.0,
         "fts_candidate_count": 0.0,
@@ -2369,29 +2338,6 @@ def check():
                 result_source = "supplemental_source"
 
     stage_timings["total_request_ms"] = (perf_counter() - request_started) * 1000
-    app.logger.info(
-        "check timing trademark=%r punctuation_fast=%s exact_search=%.1fms punctuation_exact=%.1fms prefix_search=%.1fms fallback_search=%.1fms fts=%.1fms ranking=%.1fms supplemental=%.1fms total=%.1fms candidates(exact=%.0f prefix=%.0f fts=%.0f pre_rank=%d post_cap=%d final=%d skipped(backfill=%.0f fts=%.0f remote=%.0f))",
-        term,
-        needs_runtime_normalized_search(term),
-        stage_timings["exact_sql_ms"],
-        stage_timings["punctuation_exact_ms"],
-        stage_timings["prefix_sql_ms"],
-        stage_timings["fallback_search_ms"],
-        stage_timings["fts_ms"],
-        stage_timings["python_scoring_ms"],
-        stage_timings["supplemental_lookup_ms"],
-        stage_timings["total_request_ms"],
-        stage_timings["exact_candidate_count"],
-        stage_timings["prefix_candidate_count"],
-        stage_timings["fts_candidate_count"],
-        pre_rank_candidate_count,
-        post_cap_candidate_count,
-        len(matches),
-        stage_timings.get("skipped_broad_backfill", 0.0),
-        stage_timings.get("skipped_fts", 0.0),
-        stage_timings.get("skipped_remote_fallback", 0.0),
-    )
-
     reference_classes = determine_reference_classes(matches, class_filter, term_norm)
     log_ranking_debug(matches, term_norm, reference_classes, "pre-shortlist")
     matches = prioritize_exact_matches(matches, term_norm, reference_classes)
@@ -2417,9 +2363,45 @@ def check():
     risk, risk_explanation = score_risk(all_matches, reference_classes, term_norm)
 
     patents = [summarize_patent(r, term_norm) for r in patent_rows]
-    con.close()
     patents.sort(key=lambda p: (p["active"], p["similarity"]), reverse=True)
     patents = patents[:50]
+    response_preview = {
+        "similar_marks": page_matches,
+        "chosen_class_matches": page_chosen_class_matches,
+        "cross_class_matches": page_cross_class_matches,
+        "patents": patents,
+    }
+    response_size_estimate = len(json.dumps(response_preview, ensure_ascii=False))
+    con.close()
+
+    app.logger.info(
+        "check timing trademark=%r db_open=%.1fms punctuation_fast=%s exact_search=%.1fms punctuation_exact=%.1fms prefix_search=%.1fms fallback_search=%.1fms fts=%.1fms ranking=%.1fms supplemental=%.1fms total=%.1fms candidates(exact=%.0f prefix=%.0f fts=%.0f pre_rank=%d post_cap=%d final=%d) response_bytes=%d stages(exact=%.0f prefix=%.0f phrase_family=%.0f first_token=%.0f) skipped(backfill=%.0f fts=%.0f remote=%.0f))",
+        term,
+        stage_timings["db_open_ms"],
+        needs_runtime_normalized_search(term),
+        stage_timings["exact_sql_ms"],
+        stage_timings["punctuation_exact_ms"],
+        stage_timings["prefix_sql_ms"],
+        stage_timings["fallback_search_ms"],
+        stage_timings["fts_ms"],
+        stage_timings["python_scoring_ms"],
+        stage_timings["supplemental_lookup_ms"],
+        stage_timings["total_request_ms"],
+        stage_timings["exact_candidate_count"],
+        stage_timings["prefix_candidate_count"],
+        stage_timings["fts_candidate_count"],
+        pre_rank_candidate_count,
+        post_cap_candidate_count,
+        len(all_matches),
+        response_size_estimate,
+        stage_timings.get("ran_exact_stage", 0.0),
+        stage_timings.get("ran_prefix_stage", 0.0),
+        stage_timings.get("ran_phrase_family_stage", 0.0),
+        stage_timings.get("ran_first_token_stage", 0.0),
+        stage_timings.get("skipped_broad_backfill", 0.0),
+        stage_timings.get("skipped_fts", 0.0),
+        stage_timings.get("skipped_remote_fallback", 0.0),
+    )
 
     ukipo_manual_search_url = "https://trademarks.ipo.gov.uk/ipo-tmtext?reset"
 
