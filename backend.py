@@ -45,7 +45,7 @@ HIGH_SIMILARITY_CUTOFF = float(os.getenv("HIGH_SIMILARITY_CUTOFF", "0.9"))
 MAX_RETURNED_MATCHES = max(10, int(os.getenv("MAX_RETURNED_MATCHES", "25")))
 DEFAULT_SIMILAR_LIMIT = max(1, int(os.getenv("DEFAULT_SIMILAR_LIMIT", "25")))
 MAX_SIMILAR_LIMIT = max(DEFAULT_SIMILAR_LIMIT, int(os.getenv("MAX_SIMILAR_LIMIT", "25")))
-ENABLE_STARTUP_WARMUP = os.getenv("ENABLE_STARTUP_WARMUP", "0" if RUNNING_ON_RENDER else "1") == "1"
+ENABLE_STARTUP_WARMUP = os.getenv("ENABLE_STARTUP_WARMUP", "0") == "1"
 DEBUG_RANKING = os.getenv("DEBUG_RANKING", "0") == "1"
 MARK_LIGHT_SELECT = """
     m.id,
@@ -912,9 +912,7 @@ def run_lightweight_warmup(*, allow_index_download: bool = False) -> tuple[bool,
     try:
         con = open_db()
         try:
-            country_available(con, "United Kingdom")
-            query_exact_candidates(con, "microsoft", normalize_text("microsoft"), "United Kingdom", limit=1)
-            query_related_prefix_candidates(con, "micro", "United Kingdom", limit=1)
+            con.execute("SELECT id FROM marks LIMIT 1").fetchone()
         finally:
             con.close()
     except Exception as exc:
@@ -923,11 +921,12 @@ def run_lightweight_warmup(*, allow_index_download: bool = False) -> tuple[bool,
 
 
 def warm_search_paths() -> None:
+    app.logger.info("Startup warm-up started")
     warmed, elapsed_ms, message = run_lightweight_warmup(allow_index_download=False)
     if warmed:
-        app.logger.info("Startup warm-up completed in %.1fms", elapsed_ms)
+        app.logger.info("Startup warm-up succeeded in %.1fms", elapsed_ms)
     else:
-        app.logger.info("Startup warm-up skipped: %s", message)
+        app.logger.info("Startup warm-up failed: %s", message)
 
 
 def start_background_warmup() -> None:
@@ -2431,13 +2430,15 @@ def check():
 
 @app.route("/warmup")
 def warmup():
+    app.logger.info("Warm-up endpoint started")
     warmed, elapsed_ms, message = run_lightweight_warmup(allow_index_download=False)
+    if warmed:
+        app.logger.info("Warm-up endpoint succeeded in %.1fms", elapsed_ms)
+    else:
+        app.logger.info("Warm-up endpoint failed in %.1fms: %s", elapsed_ms, message)
     return jsonify(
         {
             "ok": True,
-            "warmed": warmed,
-            "duration_ms": round(elapsed_ms, 1),
-            "message": message,
         }
     )
 

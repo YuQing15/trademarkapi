@@ -13,4 +13,4 @@ __pycache__/
 *.xml
 
 # Keep deploy config text files
-!requirements.txt
+!requirements.txttrademarks_clean.sqlite.part_*

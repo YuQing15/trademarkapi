@@ -18,7 +18,7 @@ if [ -f "${DB_PATH}" ]; then
 fi
 
 echo "Downloading database parts..."
-
+ 
 curl -fL "$PART_AA_URL" -o "$PART_AA"
 curl -fL "$PART_AB_URL" -o "$PART_AB"
 
